@@ -123,6 +123,7 @@ PREVIEW_CACHE_DIR = DATA_DIR / "preview_cache"  # Word→PDF 预览缓存，持�
 APP_VERSION = "0.1.1"
 UPDATE_REPOSITORY = "Trip1eY/Assignment_Dashboard"
 VERSION_MANIFEST = BASE_DIR / "manifest.json"
+STATIC_FILE_SUFFIXES = {".css", ".js", ".png", ".svg", ".ico"}
 
 
 def _version_key(value):
@@ -142,6 +143,21 @@ def current_app_version():
     except (OSError, json.JSONDecodeError, AttributeError):
         pass
     return APP_VERSION
+
+
+def resolve_static_file(url_path, base_dir=BASE_DIR):
+    """Resolve a public static asset without allowing access outside base_dir."""
+    if not isinstance(url_path, str) or "\\" in url_path:
+        return None
+    root = Path(base_dir).resolve()
+    candidate = (root / url_path.lstrip("/")).resolve()
+    if candidate.suffix.lower() not in STATIC_FILE_SUFFIXES:
+        return None
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
 
 THEME_PRESETS = [
     {
@@ -3773,8 +3789,8 @@ class APIHandler(SimpleHTTPRequestHandler):
             self._serve_html("dashboard_modern.html")
         else:
             # 尝试静态文件
-            file_path = BASE_DIR / path.lstrip("/")
-            if file_path.exists() and file_path.is_file():
+            file_path = resolve_static_file(path)
+            if file_path:
                 self._serve_static(file_path)
             else:
                 self.send_error(404)
