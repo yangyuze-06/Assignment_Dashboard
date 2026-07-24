@@ -32,12 +32,12 @@ echo ============================================
 echo    Assignment Dashboard Offline Repair
 echo ============================================
 echo.
-if not exist "repair_update.py" goto script_missing
-"%PYTHON_CMD%" %PYTHON_ARGS% repair_update.py %*
+if not exist "py\repair_update.py" goto script_missing
+"%PYTHON_CMD%" %PYTHON_ARGS% py\repair_update.py %*
 exit /b %ERRORLEVEL%
 
 :script_missing
-echo [ERROR] repair_update.py was not found in:
+echo [ERROR] py\repair_update.py was not found in:
 echo %CD%
 echo.
 pause

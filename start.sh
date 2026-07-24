@@ -33,8 +33,8 @@ echo "   URL: http://localhost:${PORT}"
 echo "============================================"
 echo ""
 
-if [ ! -f "server.py" ]; then
-    echo "[ERROR] 当前目录未找到 server.py"
+if [ ! -f "py/server.py" ]; then
+    echo "[ERROR] 当前目录未找到 py/server.py"
     echo "路径: $(pwd)"
     exit 1
 fi
@@ -53,7 +53,7 @@ while true; do
     echo ""
 
     set +e
-    $PYTHON_CMD -B -u server.py "$@"
+    $PYTHON_CMD -B -u py/server.py "$@"
     EXIT_CODE=$?
     set -e
 
@@ -80,7 +80,7 @@ while true; do
         echo "============================================"
         echo "服务多次启动失败"
         echo "如有更新包，请使用离线修复工具:"
-        echo "  $PYTHON_CMD repair_update.py"
+        echo "  $PYTHON_CMD py/repair_update.py"
         echo "============================================"
         read -p "是否继续重试？(y/N) " ANSWER
         if [ "$ANSWER" != "y" ] && [ "$ANSWER" != "Y" ]; then

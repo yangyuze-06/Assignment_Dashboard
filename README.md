@@ -83,7 +83,7 @@ Assignment_Dashboard 主要用于监控微信接收的作业文件，同时允�
 ```batch
 git clone https://github.com/Trip1eY/Assignment_Dashboard.git
 cd Assignment_Dashboard
-python server.py
+python py/server.py
 ```
 
 文档预览相关可选依赖：

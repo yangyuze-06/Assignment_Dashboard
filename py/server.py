@@ -63,7 +63,9 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 # ---------------------------------------------------------------------------
 # 数据路径
 # ---------------------------------------------------------------------------
-BASE_DIR = Path(__file__).parent
+PY_DIR = Path(__file__).resolve().parent
+BASE_DIR = PY_DIR.parent
+HTML_DIR = BASE_DIR / "html"
 DATA_DIR = BASE_DIR / "data"
 CONFIG_PATH = DATA_DIR / "config.json"
 STUDENTS_PATH = DATA_DIR / "students.json"
@@ -125,14 +127,24 @@ UPDATE_REPOSITORY = "Trip1eY/Assignment_Dashboard"
 VERSION_MANIFEST = BASE_DIR / "manifest.json"
 STATIC_FILE_SUFFIXES = {".css", ".js", ".png", ".svg", ".ico"}
 UPDATE_REQUIRED_FILES = (
-    "server.py",
-    "dashboard.html",
-    "dashboard_modern.html",
-    "static/classic.css",
-    "static/classic.js",
-    "static/modern.css",
-    "static/modern.js",
+    "py/launcher.py",
+    "py/server.py",
+    "html/dashboard.html",
+    "html/dashboard_modern.html",
+    "html/static/classic.css",
+    "html/static/classic.js",
+    "html/static/modern.css",
+    "html/static/modern.js",
 )
+LEGACY_UPDATE_ALIASES = {
+    "server.py": "py/launcher.py",
+    "dashboard.html": "html/dashboard.html",
+    "dashboard_modern.html": "html/dashboard_modern.html",
+    "static/classic.css": "html/static/classic.css",
+    "static/classic.js": "html/static/classic.js",
+    "static/modern.css": "html/static/modern.css",
+    "static/modern.js": "html/static/modern.js",
+}
 
 
 def _version_key(value):
@@ -154,7 +166,7 @@ def current_app_version():
     return APP_VERSION
 
 
-def resolve_static_file(url_path, base_dir=BASE_DIR):
+def resolve_static_file(url_path, base_dir=HTML_DIR):
     """Resolve a public static asset without allowing access outside base_dir."""
     if not isinstance(url_path, str) or "\\" in url_path:
         return None
@@ -5195,17 +5207,18 @@ class APIHandler(SimpleHTTPRequestHandler):
 
         safe_version = re.sub(r"[^0-9A-Za-z._-]+", "_", version).strip("._-") or "update"
         package_files = [
-            "server.py",
-            "ai_classifier.py",
-            "dashboard.html",
-            "dashboard_modern.html",
-            "static/classic.css",
-            "static/classic.js",
-            "static/modern.css",
-            "static/modern.js",
-            "restart_helper.py",
-            "pack.py",
-            "repair_update.py",
+            "py/launcher.py",
+            "py/server.py",
+            "py/ai_classifier.py",
+            "html/dashboard.html",
+            "html/dashboard_modern.html",
+            "html/static/classic.css",
+            "html/static/classic.js",
+            "html/static/modern.css",
+            "html/static/modern.js",
+            "py/restart_helper.py",
+            "py/pack.py",
+            "py/repair_update.py",
             "requirements.txt",
             "repair_update.bat",
             "启动作业追踪器.bat",
@@ -5217,7 +5230,7 @@ class APIHandler(SimpleHTTPRequestHandler):
             "app": "Assignment_Dashboard",
             "version": version,
             "created_at": datetime.now().isoformat(timespec="seconds"),
-            "files": package_files,
+            "files": package_files + list(LEGACY_UPDATE_ALIASES),
             "has_changelog": False,
             "has_announcement": len(announcements) > 0,
         }
@@ -5233,6 +5246,10 @@ class APIHandler(SimpleHTTPRequestHandler):
                     fp = BASE_DIR / name
                     if fp.exists() and fp.is_file():
                         zf.write(fp, name)
+                for legacy_name, source_name in LEGACY_UPDATE_ALIASES.items():
+                    fp = BASE_DIR / source_name
+                    if fp.exists() and fp.is_file():
+                        zf.write(fp, legacy_name)
                 if announcements:
                     zf.writestr("announcement.json", json.dumps(announcement_payload, ensure_ascii=False, indent=2).encode("utf-8"))
                 zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -5373,9 +5390,10 @@ class APIHandler(SimpleHTTPRequestHandler):
         try:
             # 备份当前关键文件
             backup_entries = []
-            for item in ["server.py", "ai_classifier.py", "dashboard.html", "dashboard_modern.html",
-                         "static/classic.css", "static/classic.js", "static/modern.css", "static/modern.js",
-                         "pack.py", "repair_update.py", "repair_update.bat", "CHANGELOG.md",
+            for item in ["py/launcher.py", "py/server.py", "py/ai_classifier.py", "py/restart_helper.py",
+                         "html/dashboard.html", "html/dashboard_modern.html", "html/static/classic.css",
+                         "html/static/classic.js", "html/static/modern.css", "html/static/modern.js",
+                         "py/pack.py", "py/repair_update.py", "repair_update.bat", "CHANGELOG.md",
                          "announcement.json", "manifest.json", "启动作业追踪器.bat",
                          "更新修复工具.bat", "start.sh", "requirements.txt"]:
                 fp = BASE_DIR / item
@@ -5603,7 +5621,7 @@ class APIHandler(SimpleHTTPRequestHandler):
             self._json({"ok": False, "msg": f"打包失败: {str(e)[:200]}"})
 
     def _serve_html(self, filename):
-        file_path = BASE_DIR / filename
+        file_path = HTML_DIR / filename
         if file_path.exists():
             self._serve_static(file_path)
         else:

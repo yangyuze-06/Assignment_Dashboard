@@ -17,33 +17,36 @@ import zipfile
 from pathlib import Path
 
 
-BASE_DIR = Path(__file__).resolve().parent
+PY_DIR = Path(__file__).resolve().parent
+BASE_DIR = PY_DIR.parent
 DATA_DIR = BASE_DIR / "data"
 LOCK_PATH = DATA_DIR / "server.lock"
 BACKUP_DIR = BASE_DIR / "backups"
 LOG_DIR = BASE_DIR / "logs"
 
 REQUIRED_FILES = (
-    "server.py",
-    "dashboard.html",
-    "dashboard_modern.html",
-    "static/classic.css",
-    "static/classic.js",
-    "static/modern.css",
-    "static/modern.js",
+    "py/launcher.py",
+    "py/server.py",
+    "html/dashboard.html",
+    "html/dashboard_modern.html",
+    "html/static/classic.css",
+    "html/static/classic.js",
+    "html/static/modern.css",
+    "html/static/modern.js",
 )
 COMMON_BACKUP_FILES = (
-    "server.py",
-    "ai_classifier.py",
-    "restart_helper.py",
-    "dashboard.html",
-    "dashboard_modern.html",
-    "static/classic.css",
-    "static/classic.js",
-    "static/modern.css",
-    "static/modern.js",
-    "pack.py",
-    "repair_update.py",
+    "py/launcher.py",
+    "py/server.py",
+    "py/ai_classifier.py",
+    "py/restart_helper.py",
+    "html/dashboard.html",
+    "html/dashboard_modern.html",
+    "html/static/classic.css",
+    "html/static/classic.js",
+    "html/static/modern.css",
+    "html/static/modern.js",
+    "py/pack.py",
+    "py/repair_update.py",
     "requirements.txt",
     "启动作业追踪器.bat",
     "更新修复工具.bat",

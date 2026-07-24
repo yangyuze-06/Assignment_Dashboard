@@ -6,8 +6,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PAGES = {
-    "dashboard.html": ("classic.css", "classic.js"),
-    "dashboard_modern.html": ("modern.css", "modern.js"),
+    "html/dashboard.html": ("classic.css", "classic.js"),
+    "html/dashboard_modern.html": ("modern.css", "modern.js"),
 }
 
 
@@ -24,9 +24,9 @@ class DashboardAssetsTest(unittest.TestCase):
     def test_referenced_assets_are_nonempty(self):
         for css_name, js_name in PAGES.values():
             with self.subTest(asset=css_name):
-                self.assertGreater((ROOT / "static" / css_name).stat().st_size, 100)
+                self.assertGreater((ROOT / "html" / "static" / css_name).stat().st_size, 100)
             with self.subTest(asset=js_name):
-                self.assertGreater((ROOT / "static" / js_name).stat().st_size, 100)
+                self.assertGreater((ROOT / "html" / "static" / js_name).stat().st_size, 100)
 
 
 if __name__ == "__main__":

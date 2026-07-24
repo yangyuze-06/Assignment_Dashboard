@@ -13,31 +13,43 @@ import zipfile
 import datetime
 import shutil
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PY_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(PY_DIR)
 BUGFIX_REQUIRED_FILES = (
-    "server.py",
-    "dashboard.html",
-    "dashboard_modern.html",
-    "static/classic.css",
-    "static/classic.js",
-    "static/modern.css",
-    "static/modern.js",
+    "py/launcher.py",
+    "py/server.py",
+    "html/dashboard.html",
+    "html/dashboard_modern.html",
+    "html/static/classic.css",
+    "html/static/classic.js",
+    "html/static/modern.css",
+    "html/static/modern.js",
 )
+LEGACY_UPDATE_ALIASES = {
+    "server.py": "py/launcher.py",
+    "dashboard.html": "html/dashboard.html",
+    "dashboard_modern.html": "html/dashboard_modern.html",
+    "static/classic.css": "html/static/classic.css",
+    "static/classic.js": "html/static/classic.js",
+    "static/modern.css": "html/static/modern.css",
+    "static/modern.js": "html/static/modern.js",
+}
 
 # 打包配置
 PACK_CONFIG = {
     "include_files": [
-        "server.py",
-        "ai_classifier.py",
-        "restart_helper.py",
-        "dashboard.html",
-        "dashboard_modern.html",
-        "static/classic.css",
-        "static/classic.js",
-        "static/modern.css",
-        "static/modern.js",
-        "pack.py",
-        "repair_update.py",
+        "py/launcher.py",
+        "py/server.py",
+        "py/ai_classifier.py",
+        "py/restart_helper.py",
+        "html/dashboard.html",
+        "html/dashboard_modern.html",
+        "html/static/classic.css",
+        "html/static/classic.js",
+        "html/static/modern.css",
+        "html/static/modern.js",
+        "py/pack.py",
+        "py/repair_update.py",
         "requirements.txt",
         "repair_update.bat",
         "启动作业追踪器.bat",
@@ -168,6 +180,14 @@ def create_update_package(version=None, file_list=None, output_name=None):
                             files_added += 1
             else:
                 print(f"  ! {fname} 不存在，跳过")
+
+        for legacy_name, source_name in LEGACY_UPDATE_ALIASES.items():
+            if source_name not in file_list:
+                continue
+            source_path = os.path.join(BASE_DIR, source_name)
+            if os.path.isfile(source_path):
+                zf.write(source_path, legacy_name)
+                files_added += 1
         
         # 添加公告文件（如果存在）
         ann_path = os.path.join(BASE_DIR, "announcement.json")
@@ -184,7 +204,10 @@ def create_update_package(version=None, file_list=None, output_name=None):
             "app": "Assignment_Dashboard",
             "version": str(version),
             "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "files": [name for name in file_list if name != "manifest.json"],
+            "files": [name for name in file_list if name != "manifest.json"] + [
+                legacy_name for legacy_name, source_name in LEGACY_UPDATE_ALIASES.items()
+                if source_name in file_list
+            ],
             "has_announcement": os.path.exists(ann_path),
         }
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -214,7 +237,7 @@ def create_bugfix_package(fix_files, version=None):
     创建Bug修复更新包（修复文件 + 更新器必需文件）
     
     参数:
-        fix_files: 修复的文件列表，如 ["server.py", "dashboard.html"]
+        fix_files: 修复的文件列表，如 ["py/server.py", "html/dashboard.html"]
         version: 版本号
     
     返回: zip_path
@@ -260,12 +283,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-  python pack.py                           # 默认打包所有文件
-  python pack.py --version 2.0.0           # 指定版本号
-  python pack.py --list                    # 列出可打包文件
-  python pack.py --bugfix server.py dashboard.html  # 创建Bug修复包
-  python pack.py --files server.py config.json       # 打包指定文件
-  python pack.py --output my_update.zip    # 自定义输出文件名
+  python py/pack.py                           # 默认打包所有文件
+  python py/pack.py --version 2.0.0           # 指定版本号
+  python py/pack.py --list                    # 列出可打包文件
+  python py/pack.py --bugfix py/server.py html/dashboard.html  # 创建Bug修复包
+  python py/pack.py --files py/server.py config.json           # 打包指定文件
+  python py/pack.py --output my_update.zip    # 自定义输出文件名
         """
     )
     parser.add_argument("--version", "-v", help="指定版本号（默认从config.json读取）")
