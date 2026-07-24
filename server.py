@@ -3424,14 +3424,7 @@ class APIHandler(SimpleHTTPRequestHandler):
         elif path == "/api/scan-existing":
             cfg = load_config()
             # 支持 target=experiment: 从公示/实验目录回填到已收作业
-            # GET 走 query string（apiGet），POST 走 body（apiPost），两者都支持
-            # TODO(方案D-Step2): 此路由当前只在 GET handler 注册；POST handler 注册后此 try 块才真正命中 body 分支
-            _qs_target = (qs.get("target", [""])[0] if qs else "")
-            try:
-                _body_target = data.get("target", "")
-            except (NameError, UnboundLocalError):
-                _body_target = ""
-            target = _qs_target or _body_target
+            target = qs.get("target", [""])[0]
             if target == "experiment":
                 if not cfg.get("experiment_enabled", False):
                     self._json({"scanned": 0, "matched": 0, "deleted": 0, "skipped_no_student": 0, "dirs": 0,
@@ -3816,6 +3809,33 @@ class APIHandler(SimpleHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _handle_lan_auth(self, data):
+        cfg = load_config_raw()
+        supplied = str(data.get("token") or "")
+        expected = str(cfg.get("lan_access_token") or "")
+        if not cfg.get("lan_access_enabled", False) or not expected or not hmac.compare_digest(supplied, expected):
+            self._json({"ok": False, "msg": "访问口令错误"}, status=401)
+            return
+        self._json({"ok": True}, extra_headers={
+            "Set-Cookie": f"{LAN_SESSION_COOKIE}={expected}; Path=/; HttpOnly; SameSite=Strict"
+        })
+
+    def _handle_network_access_configure(self, data):
+        if not self._request_is_local():
+            self._json({"ok": False, "msg": "只能在运行服务的电脑上修改访问模式"}, status=403)
+            return
+        cfg = load_config_raw()
+        enabled = bool(data.get("enabled", False))
+        if enabled and (data.get("regenerate_token") or not cfg.get("lan_access_token")):
+            cfg["lan_access_token"] = secrets.token_urlsafe(12)
+        cfg["lan_access_enabled"] = enabled
+        save_config(cfg)
+        port = self.server.server_address[1]
+        payload = network_access_payload(cfg, port, include_token=True, is_local=True)
+        payload.update({"ok": True, "restarting": True})
+        self._json(payload)
+        threading.Thread(target=_restart_after_delay, name="network-mode-restart").start()
+
     def _do_POST_impl(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -3852,34 +3872,16 @@ class APIHandler(SimpleHTTPRequestHandler):
         except:
             data = {}
 
-        if path == "/api/lan-auth":
-            cfg = load_config_raw()
-            supplied = str(data.get("token") or "")
-            expected = str(cfg.get("lan_access_token") or "")
-            if not cfg.get("lan_access_enabled", False) or not expected or not hmac.compare_digest(supplied, expected):
-                self._json({"ok": False, "msg": "访问口令错误"}, status=401)
-                return
-            self._json({"ok": True}, extra_headers={
-                "Set-Cookie": f"{LAN_SESSION_COOKIE}={expected}; Path=/; HttpOnly; SameSite=Strict"
-            })
+        json_handlers = {
+            "/api/lan-auth": self._handle_lan_auth,
+            "/api/network-access/configure": self._handle_network_access_configure,
+        }
+        handler = json_handlers.get(path)
+        if handler:
+            handler(data)
+            return
 
-        elif path == "/api/network-access/configure":
-            if not self._request_is_local():
-                self._json({"ok": False, "msg": "只能在运行服务的电脑上修改访问模式"}, status=403)
-                return
-            cfg = load_config_raw()
-            enabled = bool(data.get("enabled", False))
-            if enabled and (data.get("regenerate_token") or not cfg.get("lan_access_token")):
-                cfg["lan_access_token"] = secrets.token_urlsafe(12)
-            cfg["lan_access_enabled"] = enabled
-            save_config(cfg)
-            port = self.server.server_address[1]
-            payload = network_access_payload(cfg, port, include_token=True, is_local=True)
-            payload.update({"ok": True, "restarting": True})
-            self._json(payload)
-            threading.Thread(target=_restart_after_delay, name="network-mode-restart").start()
-
-        elif path == "/api/convert-upload":
+        if path == "/api/convert-upload":
             # JSON 模式（不支持，提示使用 multipart）
             self._json({"ok": False, "msg": "请使用表单上传文件"})
 
