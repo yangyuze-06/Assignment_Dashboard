@@ -14,6 +14,15 @@ import datetime
 import shutil
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BUGFIX_REQUIRED_FILES = (
+    "server.py",
+    "dashboard.html",
+    "dashboard_modern.html",
+    "static/classic.css",
+    "static/classic.js",
+    "static/modern.css",
+    "static/modern.js",
+)
 
 # 打包配置
 PACK_CONFIG = {
@@ -23,6 +32,10 @@ PACK_CONFIG = {
         "restart_helper.py",
         "dashboard.html",
         "dashboard_modern.html",
+        "static/classic.css",
+        "static/classic.js",
+        "static/modern.css",
+        "static/modern.js",
         "pack.py",
         "repair_update.py",
         "requirements.txt",
@@ -198,7 +211,7 @@ def create_update_package(version=None, file_list=None, output_name=None):
 
 def create_bugfix_package(fix_files, version=None):
     """
-    创建Bug修复更新包（只包含修复的文件）
+    创建Bug修复更新包（修复文件 + 更新器必需文件）
     
     参数:
         fix_files: 修复的文件列表，如 ["server.py", "dashboard.html"]
@@ -214,8 +227,9 @@ def create_bugfix_package(fix_files, version=None):
     
     print(f"[INFO] 创建Bug修复更新包...")
     print(f"[INFO] 修复文件: {fix_files}")
-    
-    return create_update_package(version, file_list=fix_files, output_name=output_name)
+
+    package_files = list(dict.fromkeys([*BUGFIX_REQUIRED_FILES, *fix_files]))
+    return create_update_package(version, file_list=package_files, output_name=output_name)
 
 
 def list_available_files():
@@ -257,7 +271,7 @@ def main():
     parser.add_argument("--version", "-v", help="指定版本号（默认从config.json读取）")
     parser.add_argument("--output", "-o", help="自定义输出文件名")
     parser.add_argument("--list", "-l", action="store_true", help="列出所有可打包文件")
-    parser.add_argument("--bugfix", "-b", nargs="+", metavar="FILE", help="创建Bug修复包（只包含指定文件）")
+    parser.add_argument("--bugfix", "-b", nargs="+", metavar="FILE", help="创建Bug修复包（自动补齐更新必需文件）")
     parser.add_argument("--files", "-f", nargs="+", metavar="FILE", help="只打包指定文件")
     parser.add_argument("--dir", "-d", help="输出目录")
     

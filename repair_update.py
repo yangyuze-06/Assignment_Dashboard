@@ -23,13 +23,25 @@ LOCK_PATH = DATA_DIR / "server.lock"
 BACKUP_DIR = BASE_DIR / "backups"
 LOG_DIR = BASE_DIR / "logs"
 
-REQUIRED_FILES = ("server.py", "dashboard.html")
+REQUIRED_FILES = (
+    "server.py",
+    "dashboard.html",
+    "dashboard_modern.html",
+    "static/classic.css",
+    "static/classic.js",
+    "static/modern.css",
+    "static/modern.js",
+)
 COMMON_BACKUP_FILES = (
     "server.py",
     "ai_classifier.py",
     "restart_helper.py",
     "dashboard.html",
     "dashboard_modern.html",
+    "static/classic.css",
+    "static/classic.js",
+    "static/modern.css",
+    "static/modern.js",
     "pack.py",
     "repair_update.py",
     "requirements.txt",
