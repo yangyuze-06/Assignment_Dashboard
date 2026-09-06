@@ -26,11 +26,28 @@ import secrets
 import socket
 import ipaddress
 import hmac
+import stat
 from http.cookies import SimpleCookie
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
+
+
+def _configure_utf8_stdio():
+    """Keep redirected Windows logs from crashing on Unicode status text."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not reconfigure:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
+_configure_utf8_stdio()
 
 # 文档解析库（可选，缺少时降级）
 try:
@@ -49,9 +66,11 @@ from urllib.parse import urlparse, parse_qs, quote
 
 try:
     import ai_classifier
+    import classifier_trainer
     HAS_AI_CLASSIFIER = True
 except Exception as _ai_import_error:
     ai_classifier = None
+    classifier_trainer = None
     HAS_AI_CLASSIFIER = False
     print(f"[WARN] 分类大脑模块不可用，已降级到原有规则：{_ai_import_error}")
 
@@ -63,7 +82,9 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 # ---------------------------------------------------------------------------
 # 数据路径
 # ---------------------------------------------------------------------------
-BASE_DIR = Path(__file__).parent
+PY_DIR = Path(__file__).resolve().parent
+BASE_DIR = PY_DIR.parent
+HTML_DIR = BASE_DIR / "html"
 DATA_DIR = BASE_DIR / "data"
 CONFIG_PATH = DATA_DIR / "config.json"
 STUDENTS_PATH = DATA_DIR / "students.json"
@@ -71,6 +92,22 @@ SUBMISSIONS_PATH = DATA_DIR / "submissions.json"
 LOCK_PATH = DATA_DIR / "server.lock"
 WATCHER_STATE_FILE = DATA_DIR / "watcher_state.json"
 AI_RULES_PATH = DATA_DIR / "ai_rules.json"
+AI_EXAMPLES_PATH = DATA_DIR / "ai_examples.json"
+AI_MODELS_DIR = DATA_DIR / "models"
+
+_ai_training_lock = threading.RLock()
+_ai_training_cancel = threading.Event()
+_ai_training_thread = None
+_ai_auto_train_timer = None
+_ai_model_cache = {"mtime": None, "bundle": {}}
+_ai_training_state = {
+    "state": "idle",
+    "phase": "",
+    "progress": 0,
+    "started_at": "",
+    "finished_at": "",
+    "error": "",
+}
 
 # ANSI 终端颜色（PowerShell 7+ / Windows Terminal 支持，旧版 PowerShell 5.1 会显示转义码）
 class C:
@@ -120,9 +157,113 @@ _DEFAULT_CLASS_FOLDER = str(Path.home() / "Desktop" / _DEFAULT_CLASS_NAME)
 ORGANIZED_DIR = Path(_DEFAULT_CLASS_FOLDER) / "已收作业"
 CONVERT_TEMP_DIR = Path(tempfile.gettempdir()) / "wechat-tracker-convert"
 PREVIEW_CACHE_DIR = DATA_DIR / "preview_cache"  # Word→PDF 预览缓存，持久化到 data/
+_IS_PREVIEW_CONVERTER = "--preview-convert" in sys.argv
 APP_VERSION = "0.1.1"
 UPDATE_REPOSITORY = "Trip1eY/Assignment_Dashboard"
 VERSION_MANIFEST = BASE_DIR / "manifest.json"
+STATIC_FILE_SUFFIXES = {".css", ".js", ".png", ".svg", ".ico"}
+UPDATE_REQUIRED_FILES = (
+    "py/launcher.py",
+    "py/server.py",
+    "html/dashboard.html",
+    "html/dashboard_modern.html",
+    "html/static/classic.css",
+    "html/static/classic.js",
+    "html/static/modern.css",
+    "html/static/modern.js",
+)
+LEGACY_UPDATE_ALIASES = {
+    "server.py": "py/launcher.py",
+    "dashboard.html": "html/dashboard.html",
+    "dashboard_modern.html": "html/dashboard_modern.html",
+    "static/classic.css": "html/static/classic.css",
+    "static/classic.js": "html/static/classic.js",
+    "static/modern.css": "html/static/modern.css",
+    "static/modern.js": "html/static/modern.js",
+}
+WINDOWS_UPDATE_FILES = ("repair_update.bat", "启动作业追踪器.bat", "更新修复工具.bat")
+UNIX_UPDATE_FILES = ("start.sh",)
+
+
+def platform_update_files(platform=None):
+    platform = (platform or sys.platform).lower()
+    return list(WINDOWS_UPDATE_FILES if platform.startswith("win") else UNIX_UPDATE_FILES)
+
+
+def _atomic_write_update_file(target, content, executable=False):
+    """Replace one update file atomically and preserve/assign executable mode."""
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    old_mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else None
+    temp_target = target.with_name(f".{target.name}.{uuid.uuid4().hex}.update-tmp")
+    try:
+        temp_target.write_bytes(content)
+        if executable:
+            temp_target.chmod((old_mode or 0o644) | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        elif old_mode is not None:
+            temp_target.chmod(old_mode)
+        os.replace(temp_target, target)
+    finally:
+        try:
+            temp_target.unlink()
+        except OSError:
+            pass
+
+
+def _update_platform_matches(target, current=None):
+    target = str(target or "").lower()
+    current = str(current or sys.platform).lower()
+    if not target or target in ("all", "universal"):
+        return True
+    if target in ("windows", "win32"):
+        return current.startswith("win")
+    if target in ("macos", "darwin", "osx"):
+        return current == "darwin"
+    if target.startswith("linux"):
+        return current.startswith("linux")
+    return target == current
+
+
+def _select_update_asset(assets, platform=None):
+    """Prefer a platform-specific update ZIP, then a legacy generic ZIP."""
+    platform = str(platform or sys.platform).lower()
+    if platform.startswith("win"):
+        compatible = {"windows", "win32", "win"}
+    elif platform == "darwin":
+        compatible = {"macos", "darwin", "osx"}
+    elif platform.startswith("linux"):
+        compatible = {"linux"}
+    else:
+        compatible = {platform}
+
+    candidates = []
+    for asset in assets or []:
+        name = str(asset.get("name", "")).lower()
+        if name.startswith("dashboard_update_v") and name.endswith(".zip"):
+            candidates.append(asset)
+
+    explicit = []
+    generic = []
+    platform_pattern = re.compile(r"(?:^|[_-])(windows|win32|win|macos|darwin|osx|linux)(?:[_-]|\.zip$)")
+    for asset in candidates:
+        name = str(asset.get("name", "")).lower()
+        match = platform_pattern.search(name)
+        if match:
+            if match.group(1) in compatible:
+                explicit.append(asset)
+        else:
+            generic.append(asset)
+    return (explicit or generic or [None])[0]
+
+
+def _normalize_update_member(name):
+    name = str(name or "").replace("\\", "/")
+    if name.startswith("/") or (len(name) >= 2 and name[1] == ":"):
+        return ""
+    parts = [part for part in name.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        return ""
+    return "/".join(parts)
 
 
 def _version_key(value):
@@ -142,6 +283,21 @@ def current_app_version():
     except (OSError, json.JSONDecodeError, AttributeError):
         pass
     return APP_VERSION
+
+
+def resolve_static_file(url_path, base_dir=HTML_DIR):
+    """Resolve a public static asset without allowing access outside base_dir."""
+    if not isinstance(url_path, str) or "\\" in url_path:
+        return None
+    root = Path(base_dir).resolve()
+    candidate = (root / url_path.lstrip("/")).resolve()
+    if candidate.suffix.lower() not in STATIC_FILE_SUFFIXES:
+        return None
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
 
 THEME_PRESETS = [
     {
@@ -314,7 +470,7 @@ _http_server = None       # ThreadingHTTPServer 实例，在 main() 里赋值
 _app_start_time = time.time()  # 进程启动时间，用于 server-status uptime 计算
 
 # 清理上次遗留的临时转换文件
-if CONVERT_TEMP_DIR.exists():
+if not _IS_PREVIEW_CONVERTER and CONVERT_TEMP_DIR.exists():
     try:
         shutil.rmtree(str(CONVERT_TEMP_DIR))
     except Exception:
@@ -324,6 +480,10 @@ _json_locks = {}
 watcher = None
 _warmup_thread = None  # 后台预热线程引用
 _warmup_lock = threading.Lock()
+_warmup_state = {
+    "status": "idle", "total": 0, "cached": 0, "queued": 0,
+    "ready": 0, "failed": 0, "started_at": "", "finished_at": "",
+}
 
 # Preview conversion is deliberately serialized. Word COM is much more stable
 # when one worker owns the conversion lifecycle instead of each HTTP request
@@ -359,15 +519,94 @@ def _find_libreoffice():
             return str(Path(value))
     return ""
 
-def _convert_preview_source(src, target):
-    """Convert one document, preferring Word and falling back to LibreOffice."""
+def _preview_converter_command(src, target):
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--preview-convert", str(src), str(target)]
+    return [sys.executable, str(Path(__file__).resolve()), "--preview-convert", str(src), str(target)]
+
+def _terminate_process_tree(process):
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=10,
+            )
+            return
+        except Exception:
+            pass
     try:
-        with _WordComContext() as ctx:
-            doc = ctx.open(src)
-            doc.ExportAsFixedFormat(str(target), 17)
-        if target.exists() and target.stat().st_size > 0:
-            return "word", ""
+        process.kill()
+    except OSError:
+        pass
+
+def _terminate_windows_pid(pid):
+    if os.name != "nt" or not pid:
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=10,
+        )
+    except Exception:
+        pass
+
+def _convert_word_isolated(src, target, timeout=45):
+    """Run Word automation outside the server so prompts and hangs cannot block it."""
+    pid_file = CONVERT_TEMP_DIR / f"word_{uuid.uuid4().hex}.pid"
+    child_env = os.environ.copy()
+    child_env["ASSIGNMENT_PREVIEW_WORD_PID_FILE"] = str(pid_file)
+    process = subprocess.Popen(
+        _preview_converter_command(src, target), stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        env=child_env,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(process)
+        try:
+            _terminate_windows_pid(pid_file.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            pass
+        try:
+            process.communicate(timeout=5)
+        except Exception:
+            pass
+        try: pid_file.unlink()
+        except OSError: pass
+        return False, f"Word 转换超过 {timeout} 秒，已终止后台转换"
+    if process.returncode == 0 and target.exists() and target.stat().st_size > 0:
+        try: pid_file.unlink()
+        except OSError: pass
+        return True, ""
+    try:
+        _terminate_windows_pid(pid_file.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        pass
+    try: pid_file.unlink()
+    except OSError: pass
+    return False, (stderr or stdout or f"Word 转换退出码 {process.returncode}")[-300:].strip()
+
+def _convert_preview_source(src, target):
+    """Convert one document in an isolated hidden process, then fall back to LibreOffice."""
+    cfg = load_config_raw()
+    try:
+        timeout = max(15, min(int(cfg.get("preview_conversion_timeout", 45)), 120))
+    except (TypeError, ValueError):
+        timeout = 45
+    word_error = ""
+    try:
+        ok, word_error = _convert_word_isolated(src, target, timeout=timeout)
+        if ok:
+            return "word-isolated", ""
+        print(f"[Preview] Word conversion failed for {src.name}: {word_error}")
     except Exception as exc:
+        word_error = str(exc)[:300]
         print(f"[Preview] Word conversion failed for {src.name}: {exc}")
 
     soffice = _find_libreoffice()
@@ -389,7 +628,7 @@ def _convert_preview_source(src, target):
             return "", str(exc)[:300]
         finally:
             shutil.rmtree(str(temp_dir), ignore_errors=True)
-    return "", "未检测到 Microsoft Word 或 LibreOffice"
+    return "", word_error or "未检测到 Microsoft Word 或 LibreOffice"
 
 def _cleanup_preview_cache():
     if not PREVIEW_CACHE_DIR.exists():
@@ -472,123 +711,126 @@ def _queue_preview_job(src):
     _preview_queue.put((job_id, src))
     return job_id, dict(job)
 
+def _collect_preview_warmup_files(cfg=None):
+    """Collect Word files visible in the dashboard without crawling WeChat history."""
+    cfg = cfg or load_config_raw()
+    try:
+        limit = max(1, min(int(cfg.get("preview_warmup_limit", 20)), 20))
+    except (TypeError, ValueError):
+        limit = 20
+    candidates = []
+    records_by_recency = []
+    for records in load_submissions().values():
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            records_by_recency.append(record)
+    records_by_recency.sort(key=lambda item: str(item.get("detected_at") or ""), reverse=True)
+    for record in records_by_recency:
+        file_info = record.get("file") if isinstance(record.get("file"), dict) else {}
+        candidates.append(file_info.get("path") or record.get("organized_to"))
+
+    roots = [_safe_resolve_path(cfg.get("organized_dir") or ORGANIZED_DIR)]
+    if cfg.get("experiment_enabled"):
+        roots.append(_safe_resolve_path(cfg.get("experiment_dir")))
+    for root in roots:
+        if not root or not root.exists() or not root.is_dir():
+            continue
+        root_files = []
+        for pattern in ("*.docx", "*.doc"):
+            try:
+                root_files.extend(root.rglob(pattern))
+            except OSError:
+                pass
+        def recent_mtime(item):
+            try:
+                return item.stat().st_mtime
+            except OSError:
+                return 0
+        root_files.sort(key=recent_mtime, reverse=True)
+        candidates.extend(root_files)
+
+    unique = {}
+    for value in candidates:
+        resolved = _safe_resolve_path(value)
+        if not resolved or not resolved.is_file() or resolved.suffix.lower() not in (".docx", ".doc"):
+            continue
+        unique.setdefault(str(resolved).lower(), resolved)
+        if len(unique) >= limit:
+            break
+    return list(unique.values())
+
+def preview_warmup_payload(cfg=None):
+    cfg = cfg or load_config_raw()
+    with _warmup_lock:
+        payload = dict(_warmup_state)
+    payload["enabled"] = bool(cfg.get("preview_warmup_enabled", False))
+    payload["queue_size"] = _preview_queue.qsize()
+    return payload
+
 def warm_preview_cache_async():
-    """[已禁用] 后台线程：预转换 .docx/.doc 文件到 PDF 缓存（Word COM 会弹窗）"""
+    """Queue dashboard Word files through the same isolated preview worker."""
     global _warmup_thread
     with _warmup_lock:
         if _warmup_thread and _warmup_thread.is_alive():
-            return  # 已有预热任务在运行
-        t = threading.Thread(target=_warm_preview_cache_worker, daemon=True)
+            return dict(_warmup_state)
+        _warmup_state.update({
+            "status": "scanning", "total": 0, "cached": 0, "queued": 0,
+            "ready": 0, "failed": 0, "started_at": datetime.now().isoformat(),
+            "finished_at": "", "error": "",
+        })
+        t = threading.Thread(target=_warm_preview_cache_worker, name="preview-warmup", daemon=True)
         t.start()
         _warmup_thread = t
+        return dict(_warmup_state)
 
 def _warm_preview_cache_worker():
-    """实际执行预热的工作线程（复用 Word COM 实例，避免重复 Disp/Quit 导致 RPC 错误）"""
-    if sys.platform != "win32":
-        # Word COM 仅在 Windows 可用，非 Windows 跳过预热
-        print("[WarmUp] Word COM 不可用（非 Windows），跳过预热")
-        return
+    """Discover files, enqueue missing previews, and aggregate worker outcomes."""
     try:
-        # 扫描已收作业目录下的所有 .docx/.doc 文件
-        doc_files = []
-        scan_roots = []
-        # 班级已收作业目录
-        if ORGANIZED_DIR.exists():
-            scan_roots.append(ORGANIZED_DIR)
-        # scan-existing 的扫描目录（多目录队列）
-        cfg = load_config_raw()
-        for d in cfg.get("scan_dirs", []):
-            resolved = _safe_resolve_path(d)
-            if resolved:
-                scan_roots.append(resolved)
-        for root in scan_roots:
-            if not root.exists():
+        doc_files = _collect_preview_warmup_files(load_config_raw())
+        cached = 0
+        jobs = []
+        for src in doc_files:
+            cache_pdf = _preview_cache_path(src)
+            if cache_pdf.exists() and cache_pdf.stat().st_size > 0:
+                cached += 1
                 continue
-            for ext in (".docx", ".doc"):
-                for f in root.rglob(f"*{ext}"):
-                    if f.is_file():
-                        doc_files.append(f)
-        if not doc_files:
-            return
-        print(f"[WarmUp] 发现 {len(doc_files)} 个 Word 文档，开始后台预热...")
-        PREVIEW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            job_id, job = _queue_preview_job(src)
+            if job.get("status") == "ready":
+                cached += 1
+            elif job_id:
+                jobs.append(job_id)
+        with _warmup_lock:
+            _warmup_state.update({"status": "running" if jobs else "complete",
+                                  "total": len(doc_files), "cached": cached,
+                                  "queued": len(jobs)})
+        print(f"[WarmUp] 发现 {len(doc_files)} 个 Word 文档，缓存命中 {cached}，排队 {len(jobs)}")
 
-        # 复用单个 Word COM 实例，避免频繁 Disp/Quit 导致 RPC 错误
-        import pythoncom
-        import win32com.client
-        pythoncom.CoInitialize()
-        word = None
-        converted = 0
-        try:
-            word = win32com.client.Dispatch("Word.Application")
-            word.Visible = False
-            word.DisplayAlerts = 0
+        pending = set(jobs)
+        while pending:
+            with _preview_jobs_lock:
+                for job_id in list(pending):
+                    if _preview_jobs.get(job_id, {}).get("status") in ("ready", "error"):
+                        pending.remove(job_id)
+                ready = sum(1 for job_id in jobs if _preview_jobs.get(job_id, {}).get("status") == "ready")
+                failed = sum(1 for job_id in jobs if _preview_jobs.get(job_id, {}).get("status") == "error")
+            with _warmup_lock:
+                _warmup_state.update({"ready": ready, "failed": failed})
+            if pending:
+                time.sleep(0.25)
 
-            for src in doc_files:
-                try:
-                    src_mtime = int(src.stat().st_mtime)
-                    cache_key = hashlib.md5(str(src).encode()).hexdigest()[:12] + f"_{src_mtime}"
-                    cache_pdf = PREVIEW_CACHE_DIR / f"{cache_key}.pdf"
-                    if cache_pdf.exists() and cache_pdf.stat().st_size > 0:
-                        continue  # 已缓存
-
-                    tmp_pdf = CONVERT_TEMP_DIR / (src.stem + "_warmup.pdf")
-                    ok = False
-                    ext = src.suffix.lower()
-
-                    if ext in (".docx", ".doc"):
-                        for attempt in range(2):  # 最多重试 1 次
-                            doc = None
-                            try:
-                                doc = word.Documents.Open(str(src), ReadOnly=True)
-                                doc.ExportAsFixedFormat(str(tmp_pdf), 17)
-                                ok = tmp_pdf.exists() and tmp_pdf.stat().st_size > 0
-                                break  # 成功，跳出重试循环
-                            except Exception as e:
-                                if attempt == 0:
-                                    print(f"[WarmUp] Word COM 失败 {src.name}: {e}，1s后重试...")
-                                    time.sleep(1)
-                                    # 重试前尝试恢复 Word
-                                    try:
-                                        if doc: doc.Close(SaveChanges=False)
-                                    except: pass
-                                else:
-                                    print(f"[WarmUp] Word COM 重试仍失败 {src.name}: {e}")
-                            finally:
-                                try:
-                                    if doc: doc.Close(SaveChanges=False)
-                                except: pass
-
-                    if ok:
-                        shutil.copy2(str(tmp_pdf), str(cache_pdf))
-                        converted += 1
-                        # 清理旧缓存
-                        hash_prefix = hashlib.md5(str(src).encode()).hexdigest()[:12]
-                        for old in PREVIEW_CACHE_DIR.glob(f"{hash_prefix}_*.pdf"):
-                            if old != cache_pdf:
-                                try: old.unlink()
-                                except: pass
-                        # 文件间小延迟，避免 Word COM 过载
-                        time.sleep(0.3)
-
-                    try:
-                        if tmp_pdf.exists():
-                            tmp_pdf.unlink()
-                    except: pass
-
-                except Exception as e:
-                    print(f"[WarmUp] 跳过 {getattr(src, 'name', src)}: {e}")
-
-        finally:
-            try:
-                if word: word.Quit()
-            except: pass
-            pythoncom.CoUninitialize()
-
-        if converted > 0:
-            print(f"[WarmUp] 预转换完成，新增 {converted} 个缓存")
+        with _warmup_lock:
+            _warmup_state.update({"status": "complete", "finished_at": datetime.now().isoformat()})
+            ready = _warmup_state["ready"]
+            failed = _warmup_state["failed"]
+        print(f"[WarmUp] 预热完成，新增 {ready}，失败 {failed}")
     except Exception as e:
         print(f"[WarmUp] 预热失败: {e}")
+        with _warmup_lock:
+            _warmup_state.update({"status": "error", "error": str(e)[:300],
+                                  "finished_at": datetime.now().isoformat()})
 
 # 智能检测实验目录（延迟初始化，通过 resolve_class_config() 获取准确路径）
 EXPERIMENT_BASE = None  # 将在 resolve_class_config() 中设置
@@ -677,17 +919,40 @@ def build_submission_record(file_info, student_name, assignment_id, assignment_n
         record.update(extra)
     return record
 
-# 微信文件目录（按平台区分）
-if sys.platform == "darwin":
-    # macOS 微信文件存储路径
-    _WECHAT_MAC_CONTAINER = Path.home() / "Library" / "Containers" / "com.tencent.xinWeChat"
-    _WECHAT_MAC_APP_SUPPORT = _WECHAT_MAC_CONTAINER / "Data" / "Library" / "Application Support" / "com.tencent.xinWeChat"
-    WECHAT_FILES_BASE = _WECHAT_MAC_APP_SUPPORT
-    XWECHAT_BASE = _WECHAT_MAC_CONTAINER / "Data"
-else:
-    WECHAT_FILES_BASE = Path.home() / "Documents" / "WeChat Files"
-    # 微信 4.x 新路径（C:\Users\xxx\xwechat_files\）
-    XWECHAT_BASE = Path.home() / "xwechat_files"
+def wechat_base_candidates(home=None, platform=None):
+    """Return platform-specific WeChat storage roots without assuming one bundle team id."""
+    home = Path(home or Path.home())
+    platform = platform or sys.platform
+    if platform == "darwin":
+        container = home / "Library" / "Containers" / "com.tencent.xinWeChat"
+        candidates = [
+            container / "Data" / "Documents" / "xwechat_files",
+            container / "Data" / "Library" / "Application Support" / "com.tencent.xinWeChat",
+            container / "Data",
+            container,
+            home / "Library" / "Application Support" / "com.tencent.xinWeChat",
+            home / "Documents" / "WeChat Files",
+            home / "xwechat_files",
+        ]
+        group_root = home / "Library" / "Group Containers"
+        try:
+            for group in sorted(group_root.glob("*.com.tencent.xinWeChat")):
+                candidates.extend([
+                    group / "Documents" / "xwechat_files",
+                    group / "Data" / "Documents" / "xwechat_files",
+                    group / "xwechat_files",
+                    group,
+                ])
+        except OSError:
+            pass
+        return list(dict.fromkeys(candidates))
+    return [home / "Documents" / "WeChat Files", home / "xwechat_files"]
+
+
+WECHAT_BASE_CANDIDATES = wechat_base_candidates()
+WECHAT_FILES_BASE = WECHAT_BASE_CANDIDATES[0]
+XWECHAT_BASE = WECHAT_BASE_CANDIDATES[1]
+_wechat_discovery_warnings = []
 
 # ---------------------------------------------------------------------------
 # 配置/数据管理
@@ -736,6 +1001,918 @@ def save_ai_rules(payload):
         raise RuntimeError("分类大脑模块不可用")
     return ai_classifier.save_rule_pack(AI_RULES_PATH, payload)
 
+
+def ai_filename_context(cfg=None, rules=None):
+    cfg = cfg or load_config_raw()
+    settings = ai_settings(cfg)
+    rules = rules or load_ai_rules()
+    protected = []
+    for subject, item in (rules.get("subjects", {}) or {}).items():
+        protected.append(subject)
+        protected.extend(item.get("confirmed_aliases", []))
+        protected.extend(item.get("keywords", []))
+    return {
+        "class_name": str(cfg.get("class_name") or "").strip(),
+        "class_aliases": list(settings.get("class_aliases") or []),
+        "protected_terms": list(dict.fromkeys(
+            str(item).strip() for item in protected if str(item).strip()
+        )),
+    }
+
+
+def inspect_ai_filename(filename, cfg=None, rules=None, students=None):
+    cfg = cfg or load_config_raw()
+    context = ai_filename_context(cfg, rules)
+    return ai_classifier.inspect_filename(
+        filename,
+        students=load_students() if students is None else students,
+        class_name=context["class_name"],
+        class_aliases=context["class_aliases"],
+        protected_terms=context["protected_terms"],
+    )
+
+
+def load_ai_examples_payload():
+    if not HAS_AI_CLASSIFIER:
+        return {"schema_version": 2, "data_version": 0, "items": [], "migrations": {}}
+    return classifier_trainer.load_examples(AI_EXAMPLES_PATH)
+
+
+def load_ai_examples():
+    return load_ai_examples_payload().get("items", [])
+
+
+def ensure_ai_examples_migrated(cfg=None):
+    if not HAS_AI_CLASSIFIER:
+        return 0
+    cfg = cfg or load_config_raw()
+    corrections = (cfg.get("match_feedback", {}) or {}).get("subject_corrections", [])
+    return classifier_trainer.migrate_subject_corrections(
+        AI_EXAMPLES_PATH,
+        corrections,
+        lambda name: inspect_ai_filename(name, cfg=cfg),
+    )
+
+
+def load_ai_model_bundle(force=False):
+    if not HAS_AI_CLASSIFIER:
+        return {}
+    bundle_path = AI_MODELS_DIR / "model_bundle.json.gz"
+    try:
+        mtime = bundle_path.stat().st_mtime_ns
+    except OSError:
+        mtime = None
+    with _ai_training_lock:
+        if force or _ai_model_cache["mtime"] != mtime:
+            _ai_model_cache["bundle"] = classifier_trainer.load_model_bundle(AI_MODELS_DIR)
+            _ai_model_cache["mtime"] = mtime
+        return _ai_model_cache["bundle"]
+
+
+def usable_ai_model_bundle():
+    """Return only a model trained from the current sample dataset."""
+    bundle = load_ai_model_bundle()
+    payload = load_ai_examples_payload()
+    if int(bundle.get("data_version", 0) or 0) != int(payload.get("data_version", 0) or 0):
+        return {}
+    return bundle
+
+
+def _active_ai_subjects(cfg=None, rules=None):
+    cfg = cfg or load_config_raw()
+    rules = rules or load_ai_rules()
+    subjects = {
+        name for name, item in (rules.get("subjects", {}) or {}).items()
+        if item.get("active", True)
+    }
+    for assignment in cfg.get("assignments", []):
+        subject = str(assignment.get("subject_group") or assignment.get("subject") or "").strip()
+        if subject and subject not in _GENERIC_SUBJECT_GROUPS:
+            subjects.add(subject)
+    return subjects
+
+
+def _set_ai_training_state(**updates):
+    with _ai_training_lock:
+        _ai_training_state.update(updates)
+
+
+def ai_model_status(cfg=None, rules=None):
+    if not HAS_AI_CLASSIFIER:
+        return {
+            "state": "unavailable",
+            "phase": "",
+            "progress": 0,
+            "sample_count": 0,
+            "trained_sample_count": 0,
+            "pending_sample_count": 0,
+            "trainable": False,
+            "trained_at": "",
+            "validation": {"status": "insufficient", "samples": 0},
+            "courses": [],
+            "error": "分类大脑模块不可用",
+        }
+    cfg = cfg or load_config_raw()
+    rules = rules or load_ai_rules()
+    ensure_ai_examples_migrated(cfg)
+    examples_payload = load_ai_examples_payload()
+    examples = examples_payload.get("items", [])
+    bundle = load_ai_model_bundle()
+    data_version = int(examples_payload.get("data_version", 0) or 0)
+    trained_data_version = int(bundle.get("data_version", 0) or 0)
+    dataset_stale = bool(bundle) and data_version != trained_data_version
+    trained_counts = ((bundle.get("meta") or {}).get("course_sample_counts") or {})
+    current_counts = {}
+    assignment_counts = {}
+    for item in examples:
+        subject = str(item.get("subject_group") or "").strip()
+        if not subject:
+            continue
+        current_counts[subject] = current_counts.get(subject, 0) + 1
+        assignment_id = str(item.get("assignment_id") or "").strip()
+        if assignment_id:
+            assignment_counts.setdefault(subject, {})
+            assignment_counts[subject][assignment_id] = (
+                assignment_counts[subject].get(assignment_id, 0) + 1
+            )
+    active_subjects = sorted(_active_ai_subjects(cfg, rules))
+    trainable_subjects = {
+        subject for subject in active_subjects
+        if current_counts.get(subject, 0) >= classifier_trainer.COURSE_MIN_PER_LABEL
+    }
+    trained_labels = set(((bundle.get("course_model") or {}).get("labels") or []))
+    assignment_models = bundle.get("assignment_models") or {}
+    with _ai_training_lock:
+        training = dict(_ai_training_state)
+    courses = []
+    for subject in active_subjects:
+        count = current_counts.get(subject, 0)
+        trained_count = int(trained_counts.get(subject, 0) or 0)
+        if training["state"] == "training" and subject in trainable_subjects:
+            state = "training"
+        elif subject in trained_labels:
+            state = (
+                "stale"
+                if dataset_stale or count != trained_count
+                else "ready"
+            )
+        elif count >= classifier_trainer.COURSE_MIN_PER_LABEL and len(trainable_subjects) >= 2:
+            state = "trainable"
+        elif count:
+            state = "collecting"
+        else:
+            state = "rules_only"
+        subject_assignment_counts = assignment_counts.get(subject, {})
+        eligible_assignments = [
+            assignment_id
+            for assignment_id, sample_count in subject_assignment_counts.items()
+            if sample_count >= classifier_trainer.ASSIGNMENT_MIN_PER_LABEL
+        ]
+        courses.append({
+            "subject_group": subject,
+            "state": state,
+            "confirmed_samples": count,
+            "trained_samples": trained_count,
+            "pending_samples": max(0, count - trained_count),
+            "assignment_state": (
+                "stale"
+                if dataset_stale and subject in assignment_models
+                else "ready"
+                if subject in assignment_models
+                else "trainable"
+                if len(eligible_assignments) >= 2
+                else "collecting"
+                if subject_assignment_counts
+                else "rules_only"
+            ),
+            "assignment_labels": len(subject_assignment_counts),
+            "trained_assignment_labels": len(
+                (assignment_models.get(subject) or {}).get("labels") or []
+            ),
+            "last_trained_at": bundle.get("trained_at", "") if subject in trained_labels else "",
+            "validation": (
+                (((bundle.get("meta") or {}).get("assignment") or {}).get(subject) or {}).get(
+                    "validation", {"status": "insufficient", "samples": 0}
+                )
+            ),
+        })
+    total = len(examples)
+    trained_total = int(bundle.get("sample_count", 0) or 0)
+    overall_state = training["state"]
+    if overall_state == "idle":
+        if dataset_stale:
+            overall_state = "stale"
+        elif bundle.get("course_model"):
+            overall_state = "ready"
+        elif total:
+            overall_state = "collecting"
+    pending_sample_count = max(0, total - trained_total)
+    if dataset_stale:
+        pending_sample_count = max(1, pending_sample_count)
+    return {
+        "state": overall_state,
+        "phase": training["phase"],
+        "progress": training["progress"],
+        "started_at": training["started_at"],
+        "finished_at": training["finished_at"],
+        "error": training["error"],
+        "sample_count": total,
+        "trained_sample_count": trained_total,
+        "pending_sample_count": pending_sample_count,
+        "trainable": len(trainable_subjects) >= 2,
+        "trained_at": bundle.get("trained_at", ""),
+        "data_version": data_version,
+        "trained_data_version": trained_data_version,
+        "dataset_stale": dataset_stale,
+        "validation": ((bundle.get("meta") or {}).get("course_validation") or {
+            "status": "insufficient",
+            "samples": 0,
+        }),
+        "courses": courses,
+    }
+
+
+def start_ai_training():
+    global _ai_training_thread, _ai_training_cancel
+    if not HAS_AI_CLASSIFIER:
+        return False, "分类大脑模块不可用"
+    with _ai_training_lock:
+        if _ai_training_thread and _ai_training_thread.is_alive():
+            return False, "模型正在训练"
+        _ai_training_cancel = threading.Event()
+        cfg = load_config_raw()
+        rules = load_ai_rules()
+        ensure_ai_examples_migrated(cfg)
+        examples_payload = load_ai_examples_payload()
+        examples = examples_payload.get("items", [])
+        counts = {}
+        for item in examples:
+            subject = str(item.get("subject_group") or "").strip()
+            if subject:
+                counts[subject] = counts.get(subject, 0) + 1
+        eligible = [
+            subject for subject, count in counts.items()
+            if count >= classifier_trainer.COURSE_MIN_PER_LABEL
+            and subject in _active_ai_subjects(cfg, rules)
+        ]
+        if len(eligible) < 2:
+            return False, "至少需要两个课程各 5 条确认样本"
+        assignments = list(cfg.get("assignments", []))
+        active_subjects = _active_ai_subjects(cfg, rules)
+        _ai_training_state.update({
+            "state": "training",
+            "phase": "preparing",
+            "progress": 5,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": "",
+            "error": "",
+        })
+
+        def worker():
+            try:
+                bundle = classifier_trainer.build_model_bundle(
+                    examples,
+                    assignments,
+                    active_subjects,
+                    cancel_event=_ai_training_cancel,
+                    data_version=examples_payload.get("data_version", 0),
+                    progress=lambda phase, value: _set_ai_training_state(
+                        phase=phase,
+                        progress=value,
+                    ),
+                )
+                if _ai_training_cancel.is_set():
+                    raise InterruptedError("训练已取消")
+                classifier_trainer.save_model_bundle(AI_MODELS_DIR, bundle)
+                load_ai_model_bundle(force=True)
+                _set_ai_training_state(
+                    state="ready",
+                    phase="complete",
+                    progress=100,
+                    finished_at=datetime.now().isoformat(timespec="seconds"),
+                    error="",
+                )
+            except InterruptedError as exc:
+                _set_ai_training_state(
+                    state="cancelled",
+                    phase="",
+                    progress=0,
+                    finished_at=datetime.now().isoformat(timespec="seconds"),
+                    error=str(exc),
+                )
+            except Exception as exc:
+                traceback.print_exc()
+                _set_ai_training_state(
+                    state="failed",
+                    phase="",
+                    progress=0,
+                    finished_at=datetime.now().isoformat(timespec="seconds"),
+                    error=str(exc)[:300],
+                )
+
+        _ai_training_thread = threading.Thread(
+            target=worker,
+            name="ai-model-training",
+            daemon=True,
+        )
+        _ai_training_thread.start()
+    return True, "训练已开始"
+
+
+def cancel_ai_training():
+    with _ai_training_lock:
+        if not _ai_training_thread or not _ai_training_thread.is_alive():
+            return False
+        _ai_training_cancel.set()
+        _ai_training_state["phase"] = "cancelling"
+        return True
+
+
+def schedule_ai_auto_train(cfg=None):
+    global _ai_auto_train_timer
+    cfg = cfg or load_config_raw()
+    settings = ai_settings(cfg)
+    if settings.get("mode") != "local_model" or not settings.get("auto_train", True):
+        return
+    status = ai_model_status(cfg)
+    if not status.get("trainable"):
+        return
+    if (
+        status.get("trained_at")
+        and not status.get("dataset_stale")
+        and status.get("pending_sample_count", 0) < classifier_trainer.AUTO_TRAIN_DELTA
+    ):
+        return
+    with _ai_training_lock:
+        if _ai_auto_train_timer:
+            _ai_auto_train_timer.cancel()
+        _ai_auto_train_timer = threading.Timer(30.0, start_ai_training)
+        _ai_auto_train_timer.name = "ai-auto-train-delay"
+        _ai_auto_train_timer.daemon = True
+        _ai_auto_train_timer.start()
+
+
+def record_ai_example(filename, subject_group, assignment=None,
+                      source="manual_confirmation", weight=1.0, cfg=None):
+    if not HAS_AI_CLASSIFIER or not filename or not subject_group:
+        return None
+    cfg = cfg or load_config_raw()
+    parsed = inspect_ai_filename(filename, cfg=cfg)
+    if not parsed.get("normalized_text"):
+        return None
+    assignment = assignment or {}
+    example = classifier_trainer.upsert_example(AI_EXAMPLES_PATH, {
+        **parsed,
+        "subject_group": subject_group,
+        "assignment_id": assignment.get("id", ""),
+        "assignment_type": assignment.get("type", ""),
+        "experiment": assignment.get("experiment", ""),
+        "source": source,
+        "weight": weight,
+    })
+    schedule_ai_auto_train(cfg)
+    return example
+
+
+def _ai_assignment_indexes(cfg=None):
+    cfg = cfg or load_config_raw()
+    active = [
+        item for item in cfg.get("assignments", [])
+        if item.get("active", True) and item.get("id")
+    ]
+    by_id = {str(item.get("id")): item for item in active}
+    subjects = _active_ai_subjects(cfg)
+    return active, by_id, subjects
+
+
+def _ai_preview_input_entries(source, data, cfg=None):
+    cfg = cfg or load_config_raw()
+    if source == "history":
+        _active, assignments_by_id, _subjects = _ai_assignment_indexes(cfg)
+        entries = []
+        input_total = 0
+        submissions = load_submissions()
+        for records in submissions.values():
+            if not isinstance(records, list):
+                continue
+            for record in records:
+                assignment_id = str(record.get("assignment_id") or "").strip()
+                assignment = assignments_by_id.get(assignment_id)
+                file_data = record.get("file") if isinstance(record.get("file"), dict) else {}
+                file_name = Path(str(file_data.get("name") or "")).name
+                if not assignment or not file_name:
+                    continue
+                input_total += 1
+                if len(entries) < 2000:
+                    entries.append({
+                        "file_name": file_name,
+                        "subject_group": str(
+                            assignment.get("subject_group") or assignment.get("subject") or ""
+                        ).strip(),
+                        "assignment_id": assignment_id,
+                        "source_detail": str(record.get("status") or "history"),
+                    })
+        return {
+            "entries": entries,
+            "input_total": input_total,
+            "truncated": input_total > len(entries),
+        }
+    raw_entries = data.get("entries")
+    if not isinstance(raw_entries, list):
+        raw_entries = data.get("filenames", [])
+    entries = []
+    for raw in raw_entries[:2000] if isinstance(raw_entries, list) else []:
+        if isinstance(raw, dict):
+            file_name = Path(str(raw.get("file_name") or raw.get("name") or "")).name
+            relative_path = str(raw.get("relative_path") or "")[:500]
+        else:
+            file_name = Path(str(raw or "")).name
+            relative_path = ""
+        if file_name:
+            entries.append({
+                "file_name": file_name,
+                "relative_path": relative_path,
+                "subject_group": str(data.get("subject_group") or "").strip(),
+                "assignment_id": str(data.get("assignment_id") or "").strip(),
+                "source_detail": source,
+            })
+    input_total = len(raw_entries) if isinstance(raw_entries, list) else 0
+    try:
+        input_total = max(input_total, min(100000, int(data.get("input_total", 0) or 0)))
+    except (TypeError, ValueError):
+        pass
+    return {
+        "entries": entries,
+        "input_total": input_total,
+        "truncated": input_total > len(entries),
+    }
+
+
+def _ai_labels_from_relative_path(relative_path, assignments):
+    text = re.sub(r"[/\\_\-]+", " ", str(relative_path or "")).casefold()
+    if not text:
+        return "", ""
+    assignment_hits = []
+    for assignment in assignments:
+        tokens = [
+            assignment.get("name"),
+            assignment.get("experiment"),
+            assignment.get("subject_group") or assignment.get("subject"),
+        ]
+        meaningful = [
+            str(token).strip().casefold()
+            for token in tokens
+            if len(str(token or "").strip()) >= 2
+        ]
+        if meaningful and sum(token in text for token in meaningful) >= 2:
+            assignment_hits.append(assignment)
+    if len(assignment_hits) == 1:
+        item = assignment_hits[0]
+        return (
+            str(item.get("subject_group") or item.get("subject") or "").strip(),
+            str(item.get("id") or "").strip(),
+        )
+    subject_hits = {
+        str(item.get("subject_group") or item.get("subject") or "").strip()
+        for item in assignments
+        if str(item.get("subject_group") or item.get("subject") or "").strip().casefold() in text
+    }
+    return (next(iter(subject_hits)), "") if len(subject_hits) == 1 else ("", "")
+
+
+def preview_ai_examples(source, data, cfg=None):
+    cfg = cfg or load_config_raw()
+    rules = load_ai_rules()
+    settings = ai_settings(cfg)
+    context = ai_filename_context(cfg, rules)
+    assignments, assignments_by_id, active_subjects = _ai_assignment_indexes(cfg)
+    existing = load_ai_examples()
+    input_payload = _ai_preview_input_entries(source, data, cfg)
+    entries = input_payload["entries"]
+    combined = {}
+    for entry in entries:
+        raw_name = Path(str(entry.get("file_name") or "")).name[:260]
+        if not raw_name:
+            continue
+        subject = str(entry.get("subject_group") or "").strip()
+        assignment_id = str(entry.get("assignment_id") or "").strip()
+        if assignment_id in assignments_by_id:
+            assignment = assignments_by_id[assignment_id]
+            subject = str(
+                assignment.get("subject_group") or assignment.get("subject") or ""
+            ).strip()
+        if not subject:
+            subject, inferred_assignment = _ai_labels_from_relative_path(
+                entry.get("relative_path", ""), assignments
+            )
+            assignment_id = assignment_id or inferred_assignment
+        parsed = inspect_ai_filename(raw_name, cfg=cfg, rules=rules)
+        subject_candidates = []
+        assignment_candidates = []
+        if not subject and parsed.get("normalized_text"):
+            subject_result = ai_classifier.classify_subject(
+                raw_name,
+                assignments=assignments,
+                rules=rules,
+                feedback=cfg.get("match_feedback", {}),
+                subject_synonyms={
+                    name: aliases for name, aliases in _SUBJECT_SYNONYMS.items()
+                    if name not in _GENERIC_SUBJECT_GROUPS
+                },
+                students=load_students(),
+                sensitivity=settings.get("sensitivity", 0.70),
+                class_name=context["class_name"],
+                class_aliases=context["class_aliases"],
+                examples=existing if settings.get("mode") == "local_model" else [],
+                model_bundle=usable_ai_model_bundle() if settings.get("mode") == "local_model" else {},
+                priority=settings.get("priority", "rules_first"),
+            )
+            subject_candidates = subject_result.get("subject_candidates", [])
+            subject = subject_result.get("subject_group", "")
+            if not subject and subject_candidates:
+                subject = str(subject_candidates[0].get("subject_group") or "")
+        if subject and not assignment_id:
+            assignment_result = classify_assignment_in_subject(
+                raw_name, subject, assignments, cfg
+            )
+            assignment_candidates = assignment_result.get("candidates", [])
+            assignment_id = assignment_result.get("assignment_id", "")
+            if not assignment_id and assignment_candidates:
+                assignment_id = str(assignment_candidates[0].get("assignment_id") or "")
+
+        status = "ready"
+        reason = ""
+        assignment = assignments_by_id.get(assignment_id) if assignment_id else None
+        if not parsed.get("normalized_text"):
+            status, reason = "empty_text", "清洗后没有可训练文本"
+        elif subject not in active_subjects:
+            status, reason = "inactive_subject", "课程不在当前启用课程中"
+        elif assignment_id and (
+            not assignment
+            or str(assignment.get("subject_group") or assignment.get("subject") or "").strip() != subject
+        ):
+            status, reason = "inactive_assignment", "作业已停用或不属于所选课程"
+        same_name = [
+            item for item in existing
+            if str(item.get("raw_name") or "").casefold() == raw_name.casefold()
+        ]
+        if status == "ready" and same_name:
+            same_label = any(
+                str(item.get("subject_group") or "") == subject
+                and str(item.get("assignment_id") or "") == assignment_id
+                for item in same_name
+            )
+            if same_label:
+                status, reason = "merge_duplicate", "将与已有相同标签样本合并计数"
+            else:
+                status, reason = "label_conflict", "样本库中已有不同课程或作业标签"
+
+        key = (raw_name.casefold(), subject.casefold(), assignment_id.casefold())
+        row = {
+            "candidate_id": hashlib.sha1(
+                "\0".join(key).encode("utf-8", errors="ignore")
+            ).hexdigest()[:20],
+            "raw_name": raw_name,
+            "normalized_text": parsed.get("normalized_text", ""),
+            "normalized_source": "parser",
+            "removed": parsed.get("removed", {}),
+            "preprocess_version": parsed.get("preprocess_version", 0),
+            "subject_group": subject,
+            "assignment_id": assignment_id,
+            "assignment_name": (
+                assignment.get("name") or assignment.get("experiment") or ""
+            ) if assignment else "",
+            "subject_candidates": subject_candidates[:3],
+            "assignment_candidates": assignment_candidates[:3],
+            "status": status,
+            "reason": reason,
+            "selected": status in ("ready", "merge_duplicate"),
+            "input_count": 1,
+            "source": "history_preview" if source == "history" else "manual_import",
+            "source_detail": entry.get("source_detail", ""),
+        }
+        if key in combined:
+            combined[key]["input_count"] += 1
+        else:
+            combined[key] = row
+
+    rows = list(combined.values())
+    labels_by_name = {}
+    for row in rows:
+        labels_by_name.setdefault(row["raw_name"].casefold(), set()).add(
+            (row["subject_group"].casefold(), row["assignment_id"].casefold())
+        )
+    for row in rows:
+        if len(labels_by_name.get(row["raw_name"].casefold(), set())) > 1:
+            row.update({
+                "status": "label_conflict",
+                "reason": "本批次中同一文件名出现了不同标签",
+                "selected": False,
+            })
+    status_counts = {}
+    for row in rows:
+        status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
+    return {
+        "rows": rows[:2000],
+        "total": len(rows),
+        "input_total": input_payload["input_total"],
+        "truncated": input_payload["truncated"],
+        "status_counts": status_counts,
+    }
+
+
+# Keep sample workbench behavior testable without going through HTTP handlers.
+def list_ai_examples(qs):
+    payload = load_ai_examples_payload()
+    items = list(reversed(payload.get("items", [])))
+    all_items = list(items)
+    subject = str((qs.get("subject") or [""])[0]).strip()
+    assignment_id = str((qs.get("assignment_id") or [""])[0]).strip()
+    source = str((qs.get("source") or [""])[0]).strip()
+    query = str((qs.get("query") or [""])[0]).strip().casefold()
+    preprocess_version = str((qs.get("preprocess_version") or [""])[0]).strip()
+    if subject:
+        items = [item for item in items if item.get("subject_group") == subject]
+    if assignment_id:
+        items = [
+            item for item in items
+            if str(item.get("assignment_id") or "") == assignment_id
+        ]
+    if source:
+        items = [item for item in items if item.get("source") == source]
+    if query:
+        items = [
+            item for item in items
+            if query in str(item.get("raw_name") or "").casefold()
+            or query in str(item.get("normalized_text") or "").casefold()
+        ]
+    if preprocess_version:
+        items = [
+            item for item in items
+            if str(item.get("preprocess_version") or "") == preprocess_version
+        ]
+    try:
+        offset = max(0, int((qs.get("offset") or [0])[0]))
+        limit = min(200, max(1, int((qs.get("limit") or [50])[0])))
+    except (TypeError, ValueError):
+        offset, limit = 0, 50
+    source_counts = {}
+    course_counts = {}
+    versions = set()
+    for item in all_items:
+        item_source = str(item.get("source") or "unknown")
+        item_subject = str(item.get("subject_group") or "")
+        source_counts[item_source] = source_counts.get(item_source, 0) + 1
+        if item_subject:
+            course_counts[item_subject] = course_counts.get(item_subject, 0) + 1
+        versions.add(int(item.get("preprocess_version") or 0))
+    return {
+        "ok": True,
+        "items": items[offset:offset + limit],
+        "total": len(items),
+        "offset": offset,
+        "limit": limit,
+        "data_version": payload.get("data_version", 0),
+        "summary": {
+            "all": len(all_items),
+            "source_counts": source_counts,
+            "course_counts": course_counts,
+            "preprocess_versions": sorted(versions),
+        },
+    }
+
+
+def _requested_ai_examples(data):
+    requested = data.get("items")
+    if isinstance(requested, list):
+        return requested[:2000]
+    filenames = data.get("filenames", [])
+    if not isinstance(filenames, list):
+        return []
+    subject = str(data.get("subject_group") or data.get("subject") or "").strip()
+    assignment_id = str(data.get("assignment_id") or "").strip()
+    return [
+        {
+            "raw_name": Path(str(filename)).name,
+            "subject_group": subject,
+            "assignment_id": assignment_id,
+            "source": "manual_import",
+        }
+        for filename in filenames[:2000]
+    ]
+
+
+def import_ai_examples(data, cfg=None):
+    cfg = cfg or load_config_raw()
+    _assignments, assignments_by_id, active_subjects = _ai_assignment_indexes(cfg)
+    requested = _requested_ai_examples(data)
+    if not requested:
+        raise ValueError("没有可导入的确认样本")
+
+    current = load_ai_examples()
+    current_labels_by_raw = {}
+    for item in current:
+        raw_key = str(item.get("raw_name") or "").casefold()
+        if raw_key:
+            current_labels_by_raw.setdefault(raw_key, set()).add((
+                str(item.get("subject_group") or ""),
+                str(item.get("assignment_id") or ""),
+            ))
+    labels_by_raw = {}
+    for item in requested:
+        if not isinstance(item, dict):
+            continue
+        raw_key = Path(
+            str(item.get("raw_name") or item.get("file_name") or "")
+        ).name.casefold()
+        label = (
+            str(item.get("subject_group") or "").strip().casefold(),
+            str(item.get("assignment_id") or "").strip().casefold(),
+        )
+        if raw_key:
+            labels_by_raw.setdefault(raw_key, set()).add(label)
+
+    prepared = []
+    errors = []
+    affected_subjects = set()
+    for index, raw_item in enumerate(requested):
+        if not isinstance(raw_item, dict):
+            errors.append({"index": index, "error": "样本格式无效"})
+            continue
+        try:
+            raw_name = Path(str(
+                raw_item.get("raw_name") or raw_item.get("file_name") or ""
+            )).name[:260]
+            subject = str(raw_item.get("subject_group") or "").strip()
+            assignment_id = str(raw_item.get("assignment_id") or "").strip()
+            if not raw_name or not subject:
+                raise ValueError("缺少文件名或课程")
+            if len(labels_by_raw.get(raw_name.casefold(), set())) > 1:
+                raise ValueError("本批次中同一文件名存在标签冲突")
+            if subject not in active_subjects:
+                raise ValueError("课程不在当前启用课程中")
+            assignment = assignments_by_id.get(assignment_id) if assignment_id else None
+            if assignment_id and (
+                not assignment
+                or str(
+                    assignment.get("subject_group") or assignment.get("subject") or ""
+                ).strip() != subject
+            ):
+                raise ValueError("作业已停用或不属于所选课程")
+            existing_labels = current_labels_by_raw.get(raw_name.casefold(), set())
+            if existing_labels and (subject, assignment_id) not in existing_labels:
+                raise ValueError("样本库中已有不同标签，请在样本库中编辑原记录")
+            parsed = inspect_ai_filename(raw_name, cfg=cfg)
+            normalized = str(
+                raw_item.get("normalized_text") or parsed.get("normalized_text") or ""
+            ).strip()[:500]
+            if not normalized:
+                raise ValueError("清洗后没有可训练文本")
+            manual_normalized = (
+                normalized != str(parsed.get("normalized_text") or "").strip()
+            )
+            prepared.append({
+                **parsed,
+                "raw_name": raw_name,
+                "normalized_text": normalized,
+                "normalized_source": "manual" if manual_normalized else "parser",
+                "subject_group": subject,
+                "assignment_id": assignment_id,
+                "assignment_type": str((assignment or {}).get("type") or ""),
+                "experiment": str((assignment or {}).get("experiment") or ""),
+                "source": (
+                    "history_confirmed"
+                    if str(raw_item.get("source") or "").startswith("history")
+                    else "manual_import"
+                ),
+                "weight": 1.0,
+                "count": max(
+                    1, min(10000, int(raw_item.get("input_count", 1) or 1))
+                ),
+            })
+            affected_subjects.add(subject)
+        except Exception as exc:
+            errors.append({
+                "index": index,
+                "file_name": Path(str(
+                    raw_item.get("raw_name") or raw_item.get("file_name") or ""
+                )).name,
+                "error": str(exc),
+            })
+    existing_version = load_ai_examples_payload().get("data_version", 0)
+    result = (
+        classifier_trainer.upsert_examples_batch(AI_EXAMPLES_PATH, prepared)
+        if prepared
+        else {"items": [], "actions": {}, "data_version": existing_version}
+    )
+    if prepared:
+        schedule_ai_auto_train(cfg)
+    return {
+        "ok": True,
+        "imported": len(prepared),
+        "actions": result.get("actions", {}),
+        "skipped": len(errors),
+        "errors": errors[:50],
+        "affected_subjects": sorted(affected_subjects),
+        "data_version": result.get("data_version", existing_version),
+        "model": ai_model_status(cfg),
+    }
+
+
+def update_ai_example(data, cfg=None):
+    cfg = cfg or load_config_raw()
+    example_id = str(data.get("id") or "").strip()
+    subject = str(data.get("subject_group") or "").strip()
+    assignment_id = str(data.get("assignment_id") or "").strip()
+    normalized = str(data.get("normalized_text") or "").strip()[:500]
+    _assignments, assignments_by_id, active_subjects = _ai_assignment_indexes(cfg)
+    if not example_id or not subject or not normalized:
+        raise ValueError("缺少样本、课程或规范化文本")
+    if subject not in active_subjects:
+        raise ValueError("课程不在当前启用课程中")
+    assignment = assignments_by_id.get(assignment_id) if assignment_id else None
+    if assignment_id and (
+        not assignment
+        or str(
+            assignment.get("subject_group") or assignment.get("subject") or ""
+        ).strip() != subject
+    ):
+        raise ValueError("作业已停用或不属于所选课程")
+    try:
+        updated = classifier_trainer.update_example(
+            AI_EXAMPLES_PATH,
+            example_id,
+            {
+                "normalized_text": normalized,
+                "normalized_source": "manual",
+                "subject_group": subject,
+                "assignment_id": assignment_id,
+                "assignment_type": str((assignment or {}).get("type") or ""),
+                "experiment": str((assignment or {}).get("experiment") or ""),
+                "source": "manual_correction",
+                "weight": 1.2,
+            },
+        )
+    except KeyError as exc:
+        raise ValueError("训练样本不存在") from exc
+    schedule_ai_auto_train(cfg)
+    return {"ok": True, "item": updated, "model": ai_model_status(cfg)}
+
+
+def delete_ai_examples(data):
+    ids = data.get("ids", [])
+    if not isinstance(ids, list) or not ids:
+        raise ValueError("请选择要删除的样本")
+    deleted = classifier_trainer.delete_examples(AI_EXAMPLES_PATH, ids[:2000])
+    if deleted:
+        schedule_ai_auto_train()
+    return {"ok": True, "deleted": deleted, "model": ai_model_status()}
+
+
+def reprocess_ai_examples(data, cfg=None):
+    cfg = cfg or load_config_raw()
+    payload = load_ai_examples_payload()
+    ids = data.get("ids", [])
+    targets = {str(item) for item in ids} if isinstance(ids, list) and ids else None
+    preserve_manual = data.get("preserve_manual", True) is not False
+    items = []
+    changed = 0
+    reprocessed = 0
+    for item in payload.get("items", []):
+        if targets is not None and str(item.get("id")) not in targets:
+            items.append(item)
+            continue
+        reprocessed += 1
+        parsed_item = inspect_ai_filename(item.get("raw_name", ""), cfg=cfg)
+        keep_manual = preserve_manual and item.get("normalized_source") == "manual"
+        normalized_text = (
+            item.get("normalized_text", "")
+            if keep_manual
+            else parsed_item.get("normalized_text", "")
+        )
+        if normalized_text != item.get("normalized_text"):
+            changed += 1
+        items.append({
+            **item,
+            **parsed_item,
+            "normalized_text": normalized_text,
+            "normalized_source": "manual" if keep_manual else "parser",
+        })
+    if reprocessed:
+        classifier_trainer.replace_examples(
+            AI_EXAMPLES_PATH,
+            items,
+            payload.get("migrations", {}),
+        )
+        schedule_ai_auto_train(cfg)
+    return {
+        "ok": True,
+        "reprocessed": reprocessed,
+        "changed": changed,
+        "model": ai_model_status(cfg),
+    }
+
+
 def ai_settings(cfg=None):
     cfg = cfg or load_config_raw()
     defaults = ai_classifier.default_settings() if HAS_AI_CLASSIFIER else {
@@ -745,12 +1922,22 @@ def ai_settings(cfg=None):
     value = cfg.get("ai_classifier")
     if isinstance(value, dict):
         defaults.update(value)
-    if defaults.get("mode") not in ("off", "rules"):
+    if defaults.get("mode") not in ("off", "rules", "local_model"):
         defaults["mode"] = "rules"
     try:
         defaults["sensitivity"] = min(0.95, max(0.50, float(defaults.get("sensitivity", 0.70))))
     except (TypeError, ValueError):
         defaults["sensitivity"] = 0.70
+    if defaults.get("priority") not in ("rules_first", "balanced", "model_first"):
+        defaults["priority"] = "rules_first"
+    defaults["auto_train"] = bool(defaults.get("auto_train", True))
+    aliases = defaults.get("class_aliases", [])
+    if not isinstance(aliases, list):
+        aliases = []
+    defaults["class_aliases"] = list(dict.fromkeys(
+        str(item).strip()[:80] for item in aliases
+        if len(str(item).strip()) >= 2
+    ))[:30]
     return defaults
 
 def ai_brain_payload():
@@ -769,6 +1956,16 @@ def ai_brain_payload():
         if stage == "subject_conflict":
             conflicts += 1
     subjects = rules.get("subjects", {})
+    model_status = ai_model_status(cfg, rules) if HAS_AI_CLASSIFIER else {
+        "state": "unavailable",
+        "sample_count": 0,
+        "courses": [],
+    }
+    students = load_students()
+    context = ai_filename_context(cfg, rules) if HAS_AI_CLASSIFIER else {
+        "class_name": cfg.get("class_name", ""),
+        "class_aliases": [],
+    }
     return {
         "ok": True,
         "available": HAS_AI_CLASSIFIER,
@@ -788,6 +1985,17 @@ def ai_brain_payload():
         "recent_feedback": list(reversed(feedback.get("subject_corrections", [])[-20:])),
         "rejected": list(reversed(feedback.get("rejected", [])[-20:])),
         "assignments": assignments,
+        "model": model_status,
+        "context": {
+            "class_name": context.get("class_name", ""),
+            "class_aliases": context.get("class_aliases", []),
+            "student_count": len(students),
+            "student_id_count": sum(
+                1 for item in students
+                if isinstance(item, dict)
+                and (item.get("student_id") or item.get("id") or item.get("学号"))
+            ),
+        },
     }
 
 def default_config():
@@ -817,11 +2025,17 @@ def default_config():
         "default_frontend": "classic",
         "lan_access_enabled": False,
         "lan_access_token": "",
+        "preview_warmup_enabled": False,
+        "preview_warmup_limit": 20,
+        "preview_conversion_timeout": 45,
         "ai_classifier": {
             "mode": "rules",
             "sensitivity": 0.70,
             "sensitivity_preset": "balanced",
             "active_semester": "",
+            "priority": "rules_first",
+            "auto_train": True,
+            "class_aliases": [],
         },
     }
 
@@ -1134,6 +2348,15 @@ def _clean_config_paths(cfg):
     cfg["ignored_assignments"] = [str(v).strip() for v in cfg.get("ignored_assignments", []) if str(v).strip()]
     if cfg.get("default_frontend") not in ("classic", "modern"):
         cfg["default_frontend"] = "classic"
+    cfg["preview_warmup_enabled"] = bool(cfg.get("preview_warmup_enabled", False))
+    try:
+        cfg["preview_warmup_limit"] = max(1, min(int(cfg.get("preview_warmup_limit", 20)), 20))
+    except (TypeError, ValueError):
+        cfg["preview_warmup_limit"] = 20
+    try:
+        cfg["preview_conversion_timeout"] = max(15, min(int(cfg.get("preview_conversion_timeout", 45)), 120))
+    except (TypeError, ValueError):
+        cfg["preview_conversion_timeout"] = 45
     return cfg
 
 def _safe_resolve_path(path_value):
@@ -1359,24 +2582,72 @@ def release_server_lock():
 # ---------------------------------------------------------------------------
 
 def discover_wechat_accounts():
-    """自动发现微信文件目录（支持新旧版本路径）"""
+    """自动发现微信文件目录，并保留权限/访问诊断供设置页展示。"""
+    global _wechat_discovery_warnings
     accounts = []
-    # 旧版路径: Documents\WeChat Files\wxid_xxx\FileStorage\File
-    for base in (WECHAT_FILES_BASE, XWECHAT_BASE):
-        if not base.exists():
-            continue
-        for d in base.iterdir():
-            if not d.is_dir():
+    warnings = []
+    seen = set()
+
+    def add_account(account):
+        key = _path_key(account)
+        if key and key not in seen:
+            seen.add(key)
+            accounts.append(str(account))
+
+    for base in WECHAT_BASE_CANDIDATES:
+        try:
+            if not base.exists():
                 continue
-            # 旧版: d/FileStorage/File
-            file_dir = d / "FileStorage" / "File"
-            if file_dir.exists():
-                accounts.append(str(d))
-            # 新版 4.x: d/msg/file (如 xwechat_files\wxid_xxx_port\msg\file)
-            msg_file_dir = d / "msg" / "file"
-            if msg_file_dir.exists():
-                accounts.append(str(d))
+            if not os.access(str(base), os.R_OK | os.X_OK):
+                warnings.append(f"微信目录无访问权限: {base}")
+                continue
+        except OSError as exc:
+            warnings.append(f"微信目录无法访问: {base} ({exc})")
+            continue
+
+        roots = [base]
+        try:
+            roots.extend(d for d in base.iterdir() if d.is_dir())
+        except PermissionError:
+            warnings.append(f"微信目录被 macOS 拒绝访问: {base}")
+            continue
+        except OSError as exc:
+            warnings.append(f"微信目录读取失败: {base} ({exc})")
+            continue
+
+        for account in roots:
+            try:
+                if (account / "FileStorage" / "File").is_dir() or (account / "msg" / "file").is_dir():
+                    add_account(account)
+            except OSError as exc:
+                warnings.append(f"微信账户目录读取失败: {account} ({exc})")
+
+    _wechat_discovery_warnings = list(dict.fromkeys(warnings))
     return accounts
+
+
+def runtime_capabilities():
+    """Return optional runtime features and actionable platform warnings."""
+    libreoffice = _find_libreoffice()
+    warnings = []
+    if not libreoffice and sys.platform != "win32":
+        warnings.append("未检测到 LibreOffice，Word 文档转换和预览功能可能不可用。")
+    if not HAS_DOCX:
+        warnings.append("未安装 python-docx，.docx 文本提取功能不可用。")
+    if not HAS_PDF:
+        warnings.append("未安装 PyPDF2，PDF 文本提取功能不可用。")
+    if sys.platform == "darwin" and _wechat_discovery_warnings:
+        warnings.append("macOS 可能阻止了微信目录访问，请检查“隐私与安全性”中的文件与文件夹或完全磁盘访问权限。")
+    return {
+        "platform": sys.platform,
+        "python": ".".join(str(v) for v in sys.version_info[:3]),
+        "docx_text": HAS_DOCX,
+        "pdf_text": HAS_PDF,
+        "libreoffice": bool(libreoffice),
+        "libreoffice_path": libreoffice,
+        "word_preview": bool(libreoffice) or sys.platform == "win32",
+        "warnings": list(dict.fromkeys(warnings)),
+    }
 
 def get_watch_dirs():
     """获取需要监控的所有微信目录（兼容新旧版本路径）"""
@@ -1756,8 +3027,12 @@ def classify_file_subject(file_info, assignments, cfg=None, source_kind="wechat"
     cfg = cfg or load_config_raw()
     filename = str((file_info or {}).get("name", ""))
 
-    if HAS_AI_CLASSIFIER and ai_settings(cfg).get("mode") == "rules":
+    settings = ai_settings(cfg)
+    if HAS_AI_CLASSIFIER and settings.get("mode") in ("rules", "local_model"):
         try:
+            ensure_ai_examples_migrated(cfg)
+            rules = load_ai_rules()
+            context = ai_filename_context(cfg, rules)
             specific_assignments = [
                 item for item in assignments
                 if str(item.get("subject_group") or item.get("subject") or "").strip() not in _GENERIC_SUBJECT_GROUPS
@@ -1769,11 +3044,16 @@ def classify_file_subject(file_info, assignments, cfg=None, source_kind="wechat"
             result = ai_classifier.classify_subject(
                 filename,
                 assignments=specific_assignments,
-                rules=load_ai_rules(),
+                rules=rules,
                 feedback=cfg.get("match_feedback", {}),
                 subject_synonyms=specific_synonyms,
                 students=load_students(),
-                sensitivity=ai_settings(cfg).get("sensitivity", 0.70),
+                sensitivity=settings.get("sensitivity", 0.70),
+                class_name=context["class_name"],
+                class_aliases=context["class_aliases"],
+                examples=load_ai_examples(),
+                model_bundle=usable_ai_model_bundle() if settings.get("mode") == "local_model" else {},
+                priority=settings.get("priority", "rules_first"),
             )
             if result.get("status") in ("subject_matched", "subject_conflict", "subject_suggested"):
                 return result
@@ -1809,7 +3089,7 @@ def classify_file_subject(file_info, assignments, cfg=None, source_kind="wechat"
     return {"status": "unmatched", "subject_group": "", "score": 0,
             "evidence": ["未识别到科目"]}
 
-def classify_assignment_in_subject(filename, subject_group, assignments):
+def classify_assignment_in_subject(filename, subject_group, assignments, cfg=None):
     """Stage two: compare only assignments in the confirmed subject."""
     candidates = []
     for assignment in assignments:
@@ -1823,7 +3103,77 @@ def classify_assignment_in_subject(filename, subject_group, assignments):
     candidates.sort(key=lambda item: item["score"], reverse=True)
     best = candidates[0] if candidates else None
     runner_score = candidates[1]["score"] if len(candidates) > 1 else -999
-    if best and best["score"] >= 75 and best["score"] - runner_score >= 15:
+    settings = ai_settings(cfg) if HAS_AI_CLASSIFIER else {"mode": "rules"}
+    if HAS_AI_CLASSIFIER and settings.get("mode") == "local_model":
+        try:
+            cfg = cfg or load_config_raw()
+            context = ai_filename_context(cfg)
+            learned = ai_classifier.classify_assignment_model(
+                filename,
+                subject_group,
+                examples=load_ai_examples(),
+                model_bundle=usable_ai_model_bundle(),
+                students=load_students(),
+                class_name=context["class_name"],
+                class_aliases=context["class_aliases"],
+                protected_terms=context["protected_terms"],
+            )
+            exact_scores = {
+                item["label"]: item["confidence"] for item in learned.get("exact", [])
+            }
+            similarity_scores = {
+                item["label"]: item["confidence"] for item in learned.get("similarity", [])
+            }
+            model_scores = {
+                item["label"]: item["confidence"] for item in learned.get("model", [])
+            }
+            priority_weight = {
+                "rules_first": 0.25,
+                "balanced": 0.50,
+                "model_first": 0.75,
+            }.get(settings.get("priority"), 0.25)
+            for item in candidates:
+                assignment_id = item["assignment_id"]
+                if assignment_id in exact_scores:
+                    item.update({
+                        "score": 99,
+                        "confidence": 0.99,
+                        "source": "feedback",
+                        "rule_score": round(item.get("score", 0) / 100, 4),
+                        "similarity_score": 1.0,
+                        "model_score": model_scores.get(assignment_id, 0.0),
+                    })
+                    continue
+                rule_score = item.get("score", 0) / 100
+                components = []
+                if rule_score:
+                    components.append((1.0 - priority_weight, rule_score))
+                if assignment_id in model_scores:
+                    components.append((priority_weight, model_scores[assignment_id]))
+                if assignment_id in similarity_scores:
+                    components.append((0.35, similarity_scores[assignment_id]))
+                if components:
+                    total_weight = sum(weight for weight, _score in components)
+                    confidence = sum(weight * score for weight, score in components) / total_weight
+                    item.update({
+                        "score": int(round(confidence * 100)),
+                        "confidence": round(confidence, 4),
+                        "source": "merged",
+                        "rule_score": round(rule_score, 4),
+                        "similarity_score": round(similarity_scores.get(assignment_id, 0.0), 4),
+                        "model_score": round(model_scores.get(assignment_id, 0.0), 4),
+                    })
+            candidates.sort(key=lambda item: item["score"], reverse=True)
+            best = candidates[0] if candidates else None
+            runner_score = candidates[1]["score"] if len(candidates) > 1 else -999
+        except Exception as exc:
+            print(f"[WARN] 科目内本地模型失败，保留规则结果：{exc}")
+    threshold = (
+        max(55, int(round(float(settings.get("sensitivity", 0.70)) * 100)))
+        if settings.get("mode") == "local_model"
+        else 75
+    )
+    if best and best["score"] >= threshold and best["score"] - runner_score >= 15:
         return {"status": "matched", "assignment_id": best["assignment_id"],
                 "score": best["score"], "candidates": candidates[:3],
                 "evidence": [f"科目内作业匹配：{best['name'] or best['experiment']}" ]}
@@ -2624,6 +3974,53 @@ def read_pdf_text(file_path):
     except Exception as e:
         return None, f"读取 .pdf 失败: {str(e)[:200]}"
 
+class _WordWindowHider:
+    """Continuously hide windows owned by the dedicated preview Word process."""
+    def __init__(self, word):
+        self.pid = 0
+        self._stop = threading.Event()
+        self._thread = None
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            pid = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(int(word.Hwnd), ctypes.byref(pid))
+            self.pid = int(pid.value)
+            pid_file = os.environ.get("ASSIGNMENT_PREVIEW_WORD_PID_FILE", "")
+            if pid_file and self.pid:
+                Path(pid_file).write_text(str(self.pid), encoding="ascii")
+        except Exception:
+            self.pid = 0
+
+    def start(self):
+        if not self.pid:
+            return
+        self._thread = threading.Thread(target=self._loop, name="word-window-hider", daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        import ctypes
+        user32 = ctypes.windll.user32
+        enum_proc_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        while not self._stop.wait(0.1):
+            def hide_if_owned(hwnd, _):
+                pid = ctypes.c_ulong()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if int(pid.value) == self.pid and user32.IsWindowVisible(hwnd):
+                    user32.ShowWindow(hwnd, 0)
+                return True
+            try:
+                user32.EnumWindows(enum_proc_type(hide_if_owned), 0)
+            except Exception:
+                return
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+
+
 class _WordComContext:
     """Word COM 上下文管理器，统一处理 COM 初始化/清理（仅 Windows）"""
     def __enter__(self):
@@ -2632,14 +4029,28 @@ class _WordComContext:
         import pythoncom
         pythoncom.CoInitialize()
         import win32com.client
-        self.word = win32com.client.Dispatch("Word.Application")
+        self.word = win32com.client.DispatchEx("Word.Application")
         self.word.Visible = False
         self.word.DisplayAlerts = 0
+        try: self.word.ScreenUpdating = False
+        except Exception: pass
+        try: self.word.EnableEvents = False
+        except Exception: pass
+        try: self.word.AutomationSecurity = 3
+        except Exception: pass
+        try: self.word.Options.SaveNormalPrompt = False
+        except Exception: pass
+        try: self.word.Options.ConfirmConversions = False
+        except Exception: pass
         self.doc = None
         return self
 
     def open(self, file_path):
-        self.doc = self.word.Documents.Open(str(file_path), ReadOnly=True)
+        self.doc = self.word.Documents.Open(
+            str(file_path), ConfirmConversions=False, ReadOnly=True,
+            AddToRecentFiles=False, Revert=False, NoEncodingDialog=True,
+            OpenAndRepair=True,
+        )
         return self.doc
 
     def __exit__(self, *args):
@@ -2665,6 +4076,33 @@ def read_doc_text_via_word(file_path):
             return doc.Content.Text, None
     except Exception as e:
         return None, f"Word COM 提取失败: {str(e)[:200]}"
+
+def _run_word_preview_converter(source, target):
+    """Entry point used only by the hidden preview conversion child process."""
+    src = Path(source).expanduser().resolve()
+    dst = Path(target).expanduser().resolve()
+    if not src.is_file() or src.suffix.lower() not in (".docx", ".doc"):
+        print("预览源文件无效", file=sys.stderr)
+        return 2
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if dst.exists():
+            dst.unlink()
+        hider = None
+        with _WordComContext() as ctx:
+            hider = _WordWindowHider(ctx.word)
+            hider.start()
+            try:
+                doc = ctx.open(src)
+                doc.ExportAsFixedFormat(str(dst), 17)
+            finally:
+                hider.stop()
+        if dst.exists() and dst.stat().st_size > 0:
+            return 0
+        print("Word 未生成有效 PDF", file=sys.stderr)
+    except Exception as exc:
+        print(f"Word 后台转换失败: {str(exc)[:300]}", file=sys.stderr)
+    return 1
 
 def read_doc_text(file_path):
     """尝试读取 .doc（旧版 Word 二进制格式）"""
@@ -3349,11 +4787,22 @@ class APIHandler(SimpleHTTPRequestHandler):
             self._json(network_access_payload(load_config_raw(), port, include_token=True,
                                               is_local=self._request_is_local()))
 
+        elif path == "/api/preview-warmup":
+            self._json({"ok": True, **preview_warmup_payload()})
+
         elif path == "/api/status":
+            watch_dirs = get_effective_watch_dirs()
+            discovered_accounts = discover_wechat_accounts()
             self._json({
                 "watching": watcher.running,
                 "known_files": len(watcher.known_files),
-                "watch_dirs": get_effective_watch_dirs(),
+                "watch_dirs": watch_dirs,
+                "capabilities": runtime_capabilities(),
+                "wechat_discovery": {
+                    "accounts_found": len(discovered_accounts),
+                    "warnings": _wechat_discovery_warnings,
+                    "manual_selection_required": sys.platform == "darwin" and not bool(discovered_accounts),
+                },
             })
 
         elif path == "/api/health":
@@ -3370,6 +4819,16 @@ class APIHandler(SimpleHTTPRequestHandler):
 
         elif path == "/api/ai/brain":
             self._json(ai_brain_payload())
+
+        elif path == "/api/ai/model/status":
+            self._json({"ok": True, "model": ai_model_status()})
+
+        elif path == "/api/ai/context":
+            brain = ai_brain_payload()
+            self._json({"ok": True, "context": brain.get("context", {})})
+
+        elif path == "/api/ai/examples":
+            self._json(list_ai_examples(qs))
 
         elif path in ("/api/ai/rules", "/api/ai/rules/export"):
             self._json({"ok": True, "rule_pack": load_ai_rules()})
@@ -3401,21 +4860,11 @@ class APIHandler(SimpleHTTPRequestHandler):
                 save_submissions(submissions)
                 watcher._save_state_if_dirty()
             self._json({"scanned": len(found), "new": found, "errors": errors})
-            # 后台预热 Word 预览缓存（已禁用：COM 弹窗问题）
-            # if found:
-            #     warm_preview_cache_async()
 
         elif path == "/api/scan-existing":
             cfg = load_config()
             # 支持 target=experiment: 从公示/实验目录回填到已收作业
-            # GET 走 query string（apiGet），POST 走 body（apiPost），两者都支持
-            # TODO(方案D-Step2): 此路由当前只在 GET handler 注册；POST handler 注册后此 try 块才真正命中 body 分支
-            _qs_target = (qs.get("target", [""])[0] if qs else "")
-            try:
-                _body_target = data.get("target", "")
-            except (NameError, UnboundLocalError):
-                _body_target = ""
-            target = _qs_target or _body_target
+            target = qs.get("target", [""])[0]
             if target == "experiment":
                 if not cfg.get("experiment_enabled", False):
                     self._json({"scanned": 0, "matched": 0, "deleted": 0, "skipped_no_student": 0, "dirs": 0,
@@ -3446,8 +4895,6 @@ class APIHandler(SimpleHTTPRequestHandler):
                 total["skipped_no_student"] += result.get("skipped_no_student", 0)
                 total["dirs"] += 1
             self._json(total)
-            # 后台预热 Word 预览缓存（已禁用：COM 弹窗问题）
-            # warm_preview_cache_async()
 
         elif path == "/api/dashboard":
             self._dashboard_data(qs.get("assignment", [None])[0])
@@ -3773,8 +5220,8 @@ class APIHandler(SimpleHTTPRequestHandler):
             self._serve_html("dashboard_modern.html")
         else:
             # 尝试静态文件
-            file_path = BASE_DIR / path.lstrip("/")
-            if file_path.exists() and file_path.is_file():
+            file_path = resolve_static_file(path)
+            if file_path:
                 self._serve_static(file_path)
             else:
                 self.send_error(404)
@@ -3799,6 +5246,33 @@ class APIHandler(SimpleHTTPRequestHandler):
                 self.end_headers()
             except Exception:
                 pass
+
+    def _handle_lan_auth(self, data):
+        cfg = load_config_raw()
+        supplied = str(data.get("token") or "")
+        expected = str(cfg.get("lan_access_token") or "")
+        if not cfg.get("lan_access_enabled", False) or not expected or not hmac.compare_digest(supplied, expected):
+            self._json({"ok": False, "msg": "访问口令错误"}, status=401)
+            return
+        self._json({"ok": True}, extra_headers={
+            "Set-Cookie": f"{LAN_SESSION_COOKIE}={expected}; Path=/; HttpOnly; SameSite=Strict"
+        })
+
+    def _handle_network_access_configure(self, data):
+        if not self._request_is_local():
+            self._json({"ok": False, "msg": "只能在运行服务的电脑上修改访问模式"}, status=403)
+            return
+        cfg = load_config_raw()
+        enabled = bool(data.get("enabled", False))
+        if enabled and (data.get("regenerate_token") or not cfg.get("lan_access_token")):
+            cfg["lan_access_token"] = secrets.token_urlsafe(12)
+        cfg["lan_access_enabled"] = enabled
+        save_config(cfg)
+        port = self.server.server_address[1]
+        payload = network_access_payload(cfg, port, include_token=True, is_local=True)
+        payload.update({"ok": True, "restarting": True})
+        self._json(payload)
+        threading.Thread(target=_restart_after_delay, name="network-mode-restart").start()
 
     def _do_POST_impl(self):
         parsed = urlparse(self.path)
@@ -3835,35 +5309,20 @@ class APIHandler(SimpleHTTPRequestHandler):
             data = json.loads(body)
         except:
             data = {}
+        if path.startswith("/api/ai/") and not HAS_AI_CLASSIFIER:
+            self._json({"ok": False, "msg": "分类大脑模块不可用，主服务仍可正常使用"})
+            return
 
-        if path == "/api/lan-auth":
-            cfg = load_config_raw()
-            supplied = str(data.get("token") or "")
-            expected = str(cfg.get("lan_access_token") or "")
-            if not cfg.get("lan_access_enabled", False) or not expected or not hmac.compare_digest(supplied, expected):
-                self._json({"ok": False, "msg": "访问口令错误"}, status=401)
-                return
-            self._json({"ok": True}, extra_headers={
-                "Set-Cookie": f"{LAN_SESSION_COOKIE}={expected}; Path=/; HttpOnly; SameSite=Strict"
-            })
+        json_handlers = {
+            "/api/lan-auth": self._handle_lan_auth,
+            "/api/network-access/configure": self._handle_network_access_configure,
+        }
+        handler = json_handlers.get(path)
+        if handler:
+            handler(data)
+            return
 
-        elif path == "/api/network-access/configure":
-            if not self._request_is_local():
-                self._json({"ok": False, "msg": "只能在运行服务的电脑上修改访问模式"}, status=403)
-                return
-            cfg = load_config_raw()
-            enabled = bool(data.get("enabled", False))
-            if enabled and (data.get("regenerate_token") or not cfg.get("lan_access_token")):
-                cfg["lan_access_token"] = secrets.token_urlsafe(12)
-            cfg["lan_access_enabled"] = enabled
-            save_config(cfg)
-            port = self.server.server_address[1]
-            payload = network_access_payload(cfg, port, include_token=True, is_local=True)
-            payload.update({"ok": True, "restarting": True})
-            self._json(payload)
-            threading.Thread(target=_restart_after_delay, name="network-mode-restart").start()
-
-        elif path == "/api/convert-upload":
+        if path == "/api/convert-upload":
             # JSON 模式（不支持，提示使用 multipart）
             self._json({"ok": False, "msg": "请使用表单上传文件"})
 
@@ -3880,8 +5339,8 @@ class APIHandler(SimpleHTTPRequestHandler):
             cfg = load_config_raw()
             current = ai_settings(cfg)
             mode = str(data.get("mode", current.get("mode", "rules"))).strip()
-            if mode not in ("off", "rules"):
-                self._json({"ok": False, "msg": "当前版本只支持关闭或规则模式"})
+            if mode not in ("off", "rules", "local_model"):
+                self._json({"ok": False, "msg": "分类模式无效"})
                 return
             try:
                 sensitivity = min(0.95, max(0.50, float(data.get("sensitivity", current["sensitivity"]))))
@@ -3891,14 +5350,67 @@ class APIHandler(SimpleHTTPRequestHandler):
             preset = str(data.get("sensitivity_preset", "custom")).strip()
             if preset not in ("conservative", "balanced", "aggressive", "custom"):
                 preset = "custom"
-            cfg["ai_classifier"] = {
+            priority = str(data.get("priority", current.get("priority", "rules_first"))).strip()
+            if priority not in ("rules_first", "balanced", "model_first"):
+                priority = "rules_first"
+            aliases = data.get("class_aliases", current.get("class_aliases", []))
+            if isinstance(aliases, str):
+                aliases = [
+                    item.strip()
+                    for item in re.split(r"[\n,，;；、]+", aliases)
+                    if item.strip()
+                ]
+            if not isinstance(aliases, list):
+                aliases = []
+            next_settings = {
                 "mode": mode,
                 "sensitivity": round(sensitivity, 2),
                 "sensitivity_preset": preset,
                 "active_semester": str(data.get("active_semester", current.get("active_semester", ""))).strip()[:100],
+                "priority": priority,
+                "auto_train": bool(data.get("auto_train", current.get("auto_train", True))),
+                "class_aliases": list(dict.fromkeys(
+                    str(item).strip()[:80] for item in aliases
+                    if len(str(item).strip()) >= 2
+                ))[:30],
             }
+            cfg["ai_classifier"] = next_settings
             save_config(cfg)
-            self._json({"ok": True, "settings": ai_settings(cfg)})
+            schedule_ai_auto_train(cfg)
+            self._json({
+                "ok": True,
+                "settings": ai_settings(cfg),
+                "model": ai_model_status(cfg),
+            })
+
+        elif path == "/api/ai/context":
+            cfg = load_config_raw()
+            class_name = str(data.get("class_name", cfg.get("class_name", ""))).strip()[:80]
+            if not class_name:
+                self._json({"ok": False, "msg": "班级名称不能为空"})
+                return
+            current = ai_settings(cfg)
+            aliases = data.get("class_aliases", current.get("class_aliases", []))
+            if isinstance(aliases, str):
+                aliases = [
+                    item.strip()
+                    for item in re.split(r"[\n,，;；、]+", aliases)
+                    if item.strip()
+                ]
+            if not isinstance(aliases, list):
+                aliases = []
+            cfg["class_name"] = class_name
+            current["class_aliases"] = list(dict.fromkeys(
+                str(item).strip()[:80] for item in aliases
+                if len(str(item).strip()) >= 2 and str(item).strip() != class_name
+            ))[:30]
+            cfg["ai_classifier"] = current
+            save_config(cfg)
+            self._json({
+                "ok": True,
+                "context": ai_brain_payload().get("context", {}),
+                "note": "班级目录路径未修改",
+            })
 
         elif path == "/api/ai/rules/save":
             if not HAS_AI_CLASSIFIER:
@@ -3963,8 +5475,99 @@ class APIHandler(SimpleHTTPRequestHandler):
             if not subject or not isinstance(filenames, list) or not filenames:
                 self._json({"ok": False, "msg": "请填写科目并选择至少一个文件"})
                 return
-            candidates = ai_classifier.extract_keyword_candidates(subject, filenames[:200], load_students())
+            cfg = load_config_raw()
+            context = ai_filename_context(cfg)
+            candidates = ai_classifier.extract_keyword_candidates(
+                subject,
+                filenames[:200],
+                load_students(),
+                class_name=context["class_name"],
+                class_aliases=context["class_aliases"],
+                protected_terms=context["protected_terms"],
+            )
             self._json({"ok": True, "subject": subject, "candidates": candidates})
+
+        elif path == "/api/ai/filename/inspect":
+            filename = str(data.get("file_name") or data.get("filename") or "").strip()
+            if not filename:
+                self._json({"ok": False, "msg": "缺少文件名"})
+                return
+            self._json({"ok": True, "result": inspect_ai_filename(filename)})
+
+        elif path == "/api/ai/examples/preview":
+            source = str(data.get("source") or "filenames").strip()
+            if source not in ("history", "filenames"):
+                self._json({"ok": False, "msg": "不支持的样本来源"})
+                return
+            preview = preview_ai_examples(source, data)
+            self._json({"ok": True, **preview})
+
+        elif path == "/api/ai/examples/import":
+            try:
+                self._json(import_ai_examples(data))
+            except ValueError as exc:
+                self._json({"ok": False, "msg": str(exc)})
+
+        elif path == "/api/ai/examples/update":
+            try:
+                self._json(update_ai_example(data))
+            except ValueError as exc:
+                self._json({"ok": False, "msg": str(exc)})
+
+        elif path == "/api/ai/examples/delete":
+            try:
+                self._json(delete_ai_examples(data))
+            except ValueError as exc:
+                self._json({"ok": False, "msg": str(exc)})
+
+        elif path == "/api/ai/examples/reprocess":
+            self._json(reprocess_ai_examples(data))
+
+        elif path == "/api/ai/model/rebuild":
+            started, message = start_ai_training()
+            self._json({
+                "ok": started,
+                "msg": message,
+                "model": ai_model_status(),
+            })
+
+        elif path == "/api/ai/model/cancel":
+            cancelled = cancel_ai_training()
+            self._json({
+                "ok": cancelled,
+                "msg": "正在取消训练" if cancelled else "当前没有训练任务",
+                "model": ai_model_status(),
+            })
+
+        elif path == "/api/ai/model/reset":
+            if data.get("confirm") is not True:
+                self._json({"ok": False, "msg": "重置模型需要明确确认"})
+                return
+            cancel_ai_training()
+            removed_models = classifier_trainer.reset_models(AI_MODELS_DIR)
+            removed_examples = 0
+            if bool(data.get("delete_examples", False)):
+                payload = load_ai_examples_payload()
+                removed_examples = len(payload.get("items", []))
+                classifier_trainer.replace_examples(
+                    AI_EXAMPLES_PATH,
+                    [],
+                    payload.get("migrations", {}),
+                )
+            load_ai_model_bundle(force=True)
+            _set_ai_training_state(
+                state="idle",
+                phase="",
+                progress=0,
+                error="",
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+            )
+            self._json({
+                "ok": True,
+                "removed_models": removed_models,
+                "removed_examples": removed_examples,
+                "model": ai_model_status(),
+            })
 
         elif path == "/api/assignment/classify":
             if not HAS_AI_CLASSIFIER:
@@ -3985,19 +5588,33 @@ class APIHandler(SimpleHTTPRequestHandler):
                 self._json({"ok": False, "msg": "缺少文件名"})
                 return
             assignments = cfg.get("assignments", [])
+            settings = ai_settings(cfg)
+            rules = load_ai_rules()
+            context = ai_filename_context(cfg, rules)
+            ensure_ai_examples_migrated(cfg)
             result = ai_classifier.classify_subject(
                 filename,
                 assignments=[item for item in assignments if str(item.get("subject_group") or item.get("subject") or "") not in _GENERIC_SUBJECT_GROUPS],
-                rules=load_ai_rules(),
+                rules=rules,
                 feedback=cfg.get("match_feedback", {}),
                 subject_synonyms={name: aliases for name, aliases in _SUBJECT_SYNONYMS.items() if name not in _GENERIC_SUBJECT_GROUPS},
                 students=load_students(),
-                sensitivity=ai_settings(cfg).get("sensitivity", 0.70),
+                sensitivity=settings.get("sensitivity", 0.70),
+                class_name=context["class_name"],
+                class_aliases=context["class_aliases"],
+                examples=load_ai_examples() if settings.get("mode") == "local_model" else [],
+                model_bundle=usable_ai_model_bundle() if settings.get("mode") == "local_model" else {},
+                priority=settings.get("priority", "rules_first"),
             )
             assignment_result = {"status": "assignment_pending", "assignment_id": "", "score": 0,
                                  "candidates": [], "evidence": []}
             if result.get("status") == "subject_matched":
-                assignment_result = classify_assignment_in_subject(filename, result.get("subject_group", ""), assignments)
+                assignment_result = classify_assignment_in_subject(
+                    filename,
+                    result.get("subject_group", ""),
+                    assignments,
+                    cfg,
+                )
             payload = {
                 **result,
                 "file_name": filename,
@@ -4094,6 +5711,13 @@ class APIHandler(SimpleHTTPRequestHandler):
             cfg["match_feedback"]["subject_corrections"] = feedback[-500:]
             save_submissions(submissions)
             save_config(cfg)
+            record_ai_example(
+                (found.get("file") or {}).get("name", ""),
+                subject_group,
+                source="subject_correction" if old_subject and old_subject != subject_group else "subject_confirmation",
+                weight=1.2 if old_subject and old_subject != subject_group else 1.0,
+                cfg=cfg,
+            )
             self._json({"ok": True, "classification": found["classification"]})
 
         elif path == "/api/submissions/assign-assignment":
@@ -4129,6 +5753,14 @@ class APIHandler(SimpleHTTPRequestHandler):
                 submissions[old_bucket].remove(found)
             found["organized_to"] = organize_file(found["file"], found["student"], assignment_id)
             save_submissions(submissions)
+            record_ai_example(
+                (found.get("file") or {}).get("name", ""),
+                str(assignment.get("subject_group") or assignment.get("subject") or ""),
+                assignment=assignment,
+                source="assignment_confirmation",
+                weight=1.0,
+                cfg=cfg,
+            )
             self._json({"ok": True, "organized_to": found["organized_to"]})
 
         elif path == "/api/submissions/reject-assignment":
@@ -4317,11 +5949,35 @@ class APIHandler(SimpleHTTPRequestHandler):
                     print(f"{C.YELLOW}[CONFIG] scan_dirs removed: {removed}{C.RESET}")
             self._json({"ok": True})
 
+        elif path == "/api/preview-warmup/configure":
+            cfg = load_config_raw()
+            cfg["preview_warmup_enabled"] = bool(data.get("enabled", False))
+            save_config(cfg)
+            self._json({"ok": True, **preview_warmup_payload(cfg)})
+
+        elif path == "/api/preview-warmup/start":
+            warm_preview_cache_async()
+            self._json({"ok": True, **preview_warmup_payload()})
+
         elif path == "/api/scan-dirs/add":
             new_dir = (data.get("path") or "").strip()
             if not new_dir:
                 self._json({"ok": False, "msg": "路径不能为空"})
                 return
+            resolved_dir = _safe_resolve_path(new_dir)
+            if not resolved_dir or not resolved_dir.exists():
+                self._json({"ok": False, "msg": f"目录不存在，请检查路径后重试: {new_dir}"})
+                return
+            if not resolved_dir.is_dir():
+                self._json({"ok": False, "msg": f"所选路径不是文件夹: {new_dir}"})
+                return
+            if not os.access(str(resolved_dir), os.R_OK | os.X_OK):
+                msg = "目录没有读取权限"
+                if sys.platform == "darwin":
+                    msg += "，请在“系统设置 → 隐私与安全性”中授权终端、Python 或当前应用"
+                self._json({"ok": False, "msg": f"{msg}: {new_dir}"})
+                return
+            new_dir = str(resolved_dir)
             cfg = load_config_raw()
             scan_dirs = cfg.get("scan_dirs", [])
             if new_dir not in scan_dirs:
@@ -5153,7 +6809,7 @@ class APIHandler(SimpleHTTPRequestHandler):
         self._json({"ok": True, "name": dest.name, "path": str(dest)})
 
     def _build_update_package(self, data):
-        """管理员一键生成更新包：当前代码 + 公告 → ZIP 下载"""
+        """开发者一键生成更新包：当前代码 + 公告 → ZIP 下载"""
         import zipfile
         from urllib.parse import quote
 
@@ -5168,25 +6824,29 @@ class APIHandler(SimpleHTTPRequestHandler):
 
         safe_version = re.sub(r"[^0-9A-Za-z._-]+", "_", version).strip("._-") or "update"
         package_files = [
-            "server.py",
-            "ai_classifier.py",
-            "dashboard.html",
-            "dashboard_modern.html",
-            "restart_helper.py",
-            "pack.py",
-            "repair_update.py",
+            "py/launcher.py",
+            "py/server.py",
+            "py/ai_classifier.py",
+            "py/classifier_features.py",
+            "py/classifier_trainer.py",
+            "html/dashboard.html",
+            "html/dashboard_modern.html",
+            "html/static/classic.css",
+            "html/static/classic.js",
+            "html/static/modern.css",
+            "html/static/modern.js",
+            "py/restart_helper.py",
+            "py/pack.py",
+            "py/repair_update.py",
             "requirements.txt",
-            "repair_update.bat",
-            "启动作业追踪器.bat",
-            "更新修复工具.bat",
-            "start.sh",
-        ]
+        ] + platform_update_files()
 
         manifest = {
             "app": "Assignment_Dashboard",
             "version": version,
+            "platform": sys.platform,
             "created_at": datetime.now().isoformat(timespec="seconds"),
-            "files": package_files,
+            "files": package_files + list(LEGACY_UPDATE_ALIASES),
             "has_changelog": False,
             "has_announcement": len(announcements) > 0,
         }
@@ -5202,6 +6862,10 @@ class APIHandler(SimpleHTTPRequestHandler):
                     fp = BASE_DIR / name
                     if fp.exists() and fp.is_file():
                         zf.write(fp, name)
+                for legacy_name, source_name in LEGACY_UPDATE_ALIASES.items():
+                    fp = BASE_DIR / source_name
+                    if fp.exists() and fp.is_file():
+                        zf.write(fp, legacy_name)
                 if announcements:
                     zf.writestr("announcement.json", json.dumps(announcement_payload, ensure_ascii=False, indent=2).encode("utf-8"))
                 zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -5253,7 +6917,13 @@ class APIHandler(SimpleHTTPRequestHandler):
             self._json({"ok": False, "msg": "最新 Release 没有找到 dashboard_update_v*.zip 更新包"}, status=404)
             return
 
-        asset = update_assets[0]
+        asset = _select_update_asset(update_assets)
+        if not asset:
+            self._json({
+                "ok": False,
+                "msg": f"最新 Release 没有适用于当前系统（{sys.platform}）的更新包",
+            }, status=404)
+            return
         latest_version = str(release.get("tag_name") or "").strip().lstrip("vV")
         self._json({
             "ok": True,
@@ -5297,14 +6967,35 @@ class APIHandler(SimpleHTTPRequestHandler):
                 if bad:
                     self._json({"ok": False, "msg": f"更新包损坏: {bad}"})
                     return
-                file_list = zf.namelist()
+                raw_file_list = [name for name in zf.namelist() if not name.endswith("/")]
+                names_by_member = {}
+                for raw_name in raw_file_list:
+                    member = _normalize_update_member(raw_name)
+                    if not member:
+                        self._json({"ok": False, "msg": f"更新包包含不安全路径: {raw_name}"})
+                        return
+                    if member in names_by_member:
+                        self._json({"ok": False, "msg": f"更新包包含重复路径: {member}"})
+                        return
+                    names_by_member[member] = raw_name
+                file_list = list(names_by_member)
         except zipfile.BadZipFile:
             self._json({"ok": False, "msg": "无效的 ZIP 文件"})
             return
 
+        if "manifest.json" in names_by_member:
+            try:
+                with zipfile.ZipFile(io.BytesIO(zip_data), "r") as zf:
+                    manifest_data = json.loads(zf.read(names_by_member["manifest.json"]).decode("utf-8"))
+                if not _update_platform_matches(manifest_data.get("platform")):
+                    self._json({"ok": False, "msg": f"更新包目标平台不匹配: {manifest_data.get('platform')}"})
+                    return
+            except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                self._json({"ok": False, "msg": f"manifest.json 无效: {exc}"})
+                return
+
         # 3. 验证关键文件存在
-        required_files = ["server.py", "dashboard.html"]
-        missing = [f for f in required_files if f not in file_list]
+        missing = [f for f in UPDATE_REQUIRED_FILES if f not in file_list]
         if missing:
             self._json({"ok": False, "msg": f"更新包缺少关键文件: {', '.join(missing)}"})
             return
@@ -5314,7 +7005,7 @@ class APIHandler(SimpleHTTPRequestHandler):
         if "CHANGELOG.md" in file_list:
             try:
                 with zipfile.ZipFile(io.BytesIO(zip_data), "r") as zf:
-                    changelog_content = zf.read("CHANGELOG.md").decode("utf-8", errors="replace")
+                    changelog_content = zf.read(names_by_member["CHANGELOG.md"]).decode("utf-8", errors="replace")
             except Exception:
                 changelog_content = ""
 
@@ -5324,7 +7015,7 @@ class APIHandler(SimpleHTTPRequestHandler):
         if "announcement.json" in file_list:
             try:
                 with zipfile.ZipFile(io.BytesIO(zip_data), "r") as zf:
-                    ann_data = zf.read("announcement.json")
+                    ann_data = zf.read(names_by_member["announcement.json"])
                     json.loads(ann_data.decode("utf-8", errors="replace"))
                     announcement_content = ann_data
                     has_announcement = True
@@ -5343,10 +7034,22 @@ class APIHandler(SimpleHTTPRequestHandler):
         try:
             # 备份当前关键文件
             backup_entries = []
-            for item in ["server.py", "ai_classifier.py", "dashboard.html", "dashboard_modern.html", "pack.py", "repair_update.py", "repair_update.bat", "CHANGELOG.md", "announcement.json", "manifest.json", "启动作业追踪器.bat", "更新修复工具.bat", "start.sh", "requirements.txt"]:
+            for item in ["py/launcher.py", "py/server.py", "py/ai_classifier.py", "py/restart_helper.py",
+                         "py/classifier_features.py", "py/classifier_trainer.py",
+                         "html/dashboard.html", "html/dashboard_modern.html", "html/static/classic.css",
+                         "html/static/classic.js", "html/static/modern.css", "html/static/modern.js",
+                         "py/pack.py", "py/repair_update.py", "repair_update.bat", "CHANGELOG.md",
+                         "announcement.json", "manifest.json", "启动作业追踪器.bat",
+                         "更新修复工具.bat", "start.sh", "requirements.txt"]:
                 fp = BASE_DIR / item
                 if fp.exists():
                     backup_entries.append((str(fp), item))
+            backed_up = {arcname for _path, arcname in backup_entries}
+            for member in file_list:
+                fp = BASE_DIR / member
+                if fp.exists() and fp.is_file() and member not in backed_up:
+                    backup_entries.append((str(fp), member))
+                    backed_up.add(member)
             # 也备份 data 目录
             data_dir = BASE_DIR / "data"
             if data_dir.exists():
@@ -5362,13 +7065,22 @@ class APIHandler(SimpleHTTPRequestHandler):
             self._json({"ok": False, "msg": f"备份失败: {str(e)[:200]}"})
             return
 
+        # 使用更新前的接力脚本执行健康检查和失败回滚，避免新包覆盖 helper 后失去恢复能力。
+        rollback_helper = DATA_DIR / ".update_restart_helper.py"
+        try:
+            shutil.copy2(PY_DIR / "restart_helper.py", rollback_helper)
+        except Exception as e:
+            self._json({"ok": False, "msg": f"准备更新接力程序失败: {str(e)[:200]}"})
+            return
+
         # 6. 解压替换文件
         updated_files = []
+        created_files = []
         try:
             with zipfile.ZipFile(io.BytesIO(zip_data), "r") as zf:
-                for member in zf.namelist():
-                    # 保护用户数据：不覆盖 data/*.json 文件
-                    if member.startswith("data/") and member.endswith(".json"):
+                for member, raw_member in names_by_member.items():
+                    # 保护用户数据和运行状态：更新包不得覆盖 data/。
+                    if member.startswith("data/"):
                         print(f"[Update] 跳过用户数据文件: {member}")
                         continue
                     # 提取到项目根目录
@@ -5379,17 +7091,17 @@ class APIHandler(SimpleHTTPRequestHandler):
                     except ValueError:
                         print(f"[Update] 安全跳过: {member} (路径越界)")
                         continue
-                    # 创建父目录
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    # 提取文件
-                    content = zf.read(member)
-                    target_path.write_bytes(content)
+                    if not target_path.exists():
+                        created_files.append(member)
+                    content = zf.read(raw_member)
+                    _atomic_write_update_file(target_path, content, executable=member.endswith(".sh"))
                     updated_files.append(member)
                     print(f"[Update] 已更新: {member}")
         except Exception as e:
             # 回滚：恢复备份
             print(f"[Update] 解压失败，开始回滚: {e}")
-            self._restore_backup(backup_path)
+            self._restore_backup(backup_path, created_files)
+            rollback_helper.unlink(missing_ok=True)
             self._json({"ok": False, "msg": f"更新失败，已自动回滚: {str(e)[:200]}"})
             return
 
@@ -5407,7 +7119,11 @@ class APIHandler(SimpleHTTPRequestHandler):
             time.sleep(0.8)
             print("[Update] 正在重启服务...")
             try:
-                _restart_server()
+                _restart_server(
+                    backup_path=backup_path,
+                    created_files=created_files,
+                    helper_path=rollback_helper,
+                )
             except Exception as e:
                 print(f"[Update] 重启失败: {e}")
 
@@ -5423,15 +7139,34 @@ class APIHandler(SimpleHTTPRequestHandler):
             "has_announcement": has_announcement,
         })
 
-    def _restore_backup(self, backup_path):
+    def _restore_backup(self, backup_path, created_files=None):
         """从备份恢复文件"""
         import zipfile
         try:
             if not backup_path.exists():
                 print("[Update] 备份文件不存在，无法回滚")
                 return
+            for member in created_files or []:
+                safe = _normalize_update_member(member)
+                if not safe:
+                    continue
+                target = (BASE_DIR / safe).resolve()
+                try:
+                    target.relative_to(BASE_DIR.resolve())
+                    if target.is_file() or target.is_symlink():
+                        target.unlink()
+                except (OSError, ValueError):
+                    pass
             with zipfile.ZipFile(backup_path, "r") as zf:
-                zf.extractall(BASE_DIR)
+                for raw_name in zf.namelist():
+                    if raw_name.endswith("/"):
+                        continue
+                    member = _normalize_update_member(raw_name)
+                    if not member or member == "data/server.lock":
+                        continue
+                    target = (BASE_DIR / member).resolve()
+                    target.relative_to(BASE_DIR.resolve())
+                    _atomic_write_update_file(target, zf.read(raw_name), executable=member.endswith(".sh"))
             print("[Update] 回滚成功")
         except Exception as e:
             print(f"[Update] 回滚失败: {e}")
@@ -5569,7 +7304,7 @@ class APIHandler(SimpleHTTPRequestHandler):
             self._json({"ok": False, "msg": f"打包失败: {str(e)[:200]}"})
 
     def _serve_html(self, filename):
-        file_path = BASE_DIR / filename
+        file_path = HTML_DIR / filename
         if file_path.exists():
             self._serve_static(file_path)
         else:
@@ -5619,7 +7354,12 @@ def main():
     parser = argparse.ArgumentParser(description="作业提交追踪器")
     parser.add_argument("--port", type=int, default=18765, help="HTTP 服务端口")
     parser.add_argument("--no-watch", action="store_true", help="不启动文件监控")
+    parser.add_argument("--preview-convert", nargs=2, metavar=("SOURCE", "TARGET"),
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args.preview_convert:
+        return _run_word_preview_converter(*args.preview_convert)
 
     print("=" * 50)
     print(f"  作业提交追踪器  v{current_app_version()}")
@@ -5683,11 +7423,18 @@ def main():
 
     print("按 Ctrl+C 停止\n")
 
-    # 启动后预热 Word 预览缓存（已禁用：COM 弹窗问题）
-    # warm_preview_cache_async()
-
     # 启动自动回填：扫描公示目录，未入库文件自动入库
     _auto_backfill_from_experiment()
+
+    if HAS_AI_CLASSIFIER:
+        try:
+            ensure_ai_examples_migrated(startup_cfg)
+            schedule_ai_auto_train(startup_cfg)
+        except Exception as exc:
+            print(f"[WARN] 本地模型初始化失败，继续使用规则分类：{exc}")
+
+    if startup_cfg.get("preview_warmup_enabled", False):
+        warm_preview_cache_async()
 
     try:
         server.serve_forever()
@@ -5723,7 +7470,7 @@ def _restart_after_delay():
     time.sleep(0.8)
     _restart_server()
 
-def _restart_server():
+def _restart_server(backup_path=None, created_files=None, helper_path=None):
     """Restart through a detached helper so Windows can finish releasing the port."""
     # 取出端口：优先从 _http_server 拿实际 bind 的端口
     port = None
@@ -5744,19 +7491,32 @@ def _restart_server():
     if port is None:
         port = 18765  # 与 main() 默认值保持一致
     try:
-        helper_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "restart_helper.py")
+        helper_path = str(helper_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "restart_helper.py"))
         if not os.path.exists(helper_path):
             raise RuntimeError("restart_helper.py is missing; please reinstall the update package")
 
         # Hand off before stopping this process. The helper waits for the port
         # to disappear and retries child startup if Windows is still releasing it.
         release_server_lock()
-        helper_kwargs = {"cwd": os.path.dirname(os.path.abspath(__file__))}
+        helper_env = os.environ.copy()
+        helper_env["PYTHONUTF8"] = "1"
+        helper_env["PYTHONIOENCODING"] = "utf-8"
+        helper_kwargs = {
+            "cwd": os.path.dirname(os.path.abspath(__file__)),
+            "env": helper_env,
+        }
         if sys.platform == "win32":
             helper_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        else:
+            helper_kwargs["start_new_session"] = True
+        helper_command = [sys.executable, helper_path, "--port", str(port)]
+        if backup_path:
+            helper_command.extend(["--backup", str(backup_path), "--base-dir", str(BASE_DIR)])
+            for member in created_files or []:
+                helper_command.extend(["--created", str(member)])
+        helper_command.extend(["--", sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
         helper_proc = subprocess.Popen(
-            [sys.executable, helper_path, "--port", str(port), "--", sys.executable,
-             os.path.abspath(__file__)] + sys.argv[1:],
+            helper_command,
             **helper_kwargs
         )
         print(f"[Restart] 接力进程已启动，PID: {helper_proc.pid}")
@@ -5781,4 +7541,4 @@ def _restart_server():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main() or 0)

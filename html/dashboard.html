@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>作业提交追踪仪表盘</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23111127'/%3E%3Crect x='14' y='14' width='14' height='14' rx='3' fill='%238b5cf6'/%3E%3Crect x='36' y='14' width='14' height='14' rx='3' fill='%2322d3a6'/%3E%3Crect x='14' y='36' width='14' height='14' rx='3' fill='%2322d3a6'/%3E%3Crect x='36' y='36' width='14' height='14' rx='3' fill='%238b5cf6'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/classic.css">
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <h1> 作业提交追踪仪表盘</h1>
+    <div class="header-status">
+      <span><span class="status-dot live" id="status-dot"></span><span id="status-text">监控中</span></span>
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--text-secondary)" title="开启/关闭微信文件监控">
+        <input type="checkbox" id="watch-toggle" onchange="toggleWatch()" checked style="display:none">
+        <span id="watch-switch" style="width:36px;height:20px;border-radius:10px;background:var(--green);position:relative;transition:background 0.3s;display:inline-block">
+          <span style="position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:left 0.3s"></span>
+        </span>
+        <span>监控开关</span>
+      </label>
+      <span style="font-size:12px;color:var(--text-secondary)" id="clock"></span>
+      <button class="btn btn-ghost btn-icon" onclick="location.reload()" title="刷新">↻</button>
+      <button class="btn btn-primary" id="scan-existing-btn" onclick="scanExisting(event)">📂 扫描已有文件</button>
+      <button class="btn btn-ghost" onclick="openConvertModal()">📄 docx→PDF</button>
+      <button class="btn btn-primary" id="scan-now-btn" onclick="scanNow(event)"> 立即扫描</button>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs" style="margin-bottom:20px">
+    <div class="tab active" onclick="switchTab('dashboard')"> 仪表盘</div>
+    <div class="tab" onclick="switchTab('assignments')">📋 作业列表</div>
+    <div class="tab" onclick="switchTab('manage')">⚙ 管理</div>
+  </div>
+
+  <!-- Dashboard Tab -->
+  <div id="tab-dashboard">
+    <!-- Stats Row -->
+    <div class="stats-row">
+      <div class="stat-card total">
+        <div class="number" id="stat-total">0</div>
+        <div class="label">学生总数</div>
+      </div>
+      <div class="stat-card submitted">
+        <div class="number" id="stat-submitted">0</div>
+        <div class="label">已提交</div>
+      </div>
+      <div class="stat-card not-submitted">
+        <div class="number" id="stat-missing">0</div>
+        <div class="label">未提交</div>
+      </div>
+      <div class="stat-card rate">
+        <div class="number" id="stat-rate">0%</div>
+        <div class="label">提交率</div>
+      </div>
+      <div class="stat-card unmatched-stat" id="stat-unmatched-card" style="display:none">
+        <div class="number" id="stat-unmatched">0</div>
+        <div class="label">未归类文件</div>
+      </div>
+    </div>
+
+    <!-- 截止倒计时大模块 -->
+    <div id="due-big-board" class="convert-box" style="margin-bottom:16px;padding:16px;display:none">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+        <span style="font-size:15px;font-weight:700">⏰ 截止倒计时</span>
+        <span style="font-size:11px;color:var(--text-secondary)">（已完成科目不显示）</span>
+      </div>
+      <div id="due-big-list" style="display:flex;flex-wrap:wrap;gap:10px"></div>
+    </div>
+
+    <!-- Progress Bar -->
+    <div class="progress-section">
+      <h3> 提交进度 <span id="progress-text" style="float:right;color:var(--accent)">0/0</span></h3>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+        <select id="subject-selector" onchange="switchSubject(this.value)" style="padding:6px 10px;border-radius:8px;border:1px solid var(--card-border);background:var(--card-bg);color:var(--text);font-size:13px;max-width:300px">
+          <option value="">全部科目</option>
+        </select>
+        <span id="countdown-display" style="font-size:12px"></span>
+      </div>
+      <div class="progress-bar-wrap">
+        <div class="progress-bar-fill" id="progress-bar" style="width: 0%"></div>
+      </div>
+      <div id="experiment-progress-list" style="margin-top:8px"></div>
+    </div>
+
+    <!-- Unmatched Files -->
+    <div class="unmatched-section hidden" id="unmatched-section">
+      <div class="unmatched-header" onclick="toggleUnmatched()">
+        <h3 id="unmatched-title">⚠ 未归类文件 <span class="unmatched-badge" id="unmatched-count-badge">0</span></h3>
+        <span style="display:flex;align-items:center;gap:8px">
+          <button class="unmatched-toggle" id="unmatched-toggle" type="button" onclick="event.stopPropagation();toggleUnmatched()">展开</button>
+        </span>
+      </div>
+      <div class="unmatched-list" id="unmatched-list"></div>
+      <div class="batch-toolbar" id="batch-toolbar">
+        <label class="select-all-label"><input type="checkbox" id="select-all-checkbox" onchange="toggleSelectAll()">全选</label>
+        <button class="batch-btn" onclick="batchIgnore()">批量忽略</button>
+        <span style="font-size:11px;color:var(--text-secondary)" id="batch-hint"></span>
+      </div>
+    </div>
+
+    <!-- Student Cards Grid -->
+    <div class="section-title">
+      学生提交状态
+      <span class="badge" id="grid-count">0</span>
+    </div>
+    <div class="toolbar">
+      <input type="text" id="search-input" placeholder="搜索学生姓名或学号..." oninput="renderDashboard()">
+      <select id="filter-select" onchange="renderDashboard()">
+        <option value="all">全部</option>
+        <option value="submitted">已提交</option>
+        <option value="not-submitted">未提交</option>
+      </select>
+    </div>
+    <div class="student-grid" id="student-grid"></div>
+
+    <!-- Recent Files -->
+    <div class="file-list-section" style="margin-top:20px">
+      <div class="section-title"> 最近接收的文件</div>
+      <table class="file-table">
+        <thead><tr><th>文件名</th><th>学生</th><th>大小</th><th>时间</th><th>操作</th></tr></thead>
+        <tbody id="file-table-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Assignments Tab -->
+  <div id="tab-assignments" class="hidden">
+    <!-- Assignment Detail View (hidden by default, shown when clicking into an assignment) -->
+    <div id="assignment-detail" class="hidden">
+      <button class="btn btn-ghost" onclick="showAssignmentList()" style="margin-bottom:16px">← 返回作业列表</button>
+      <div class="progress-section">
+        <h1 id="ad-title" style="font-size:28px;margin-bottom:12px">作业详情 <span id="ad-progress" style="float:right;color:var(--accent);font-size:22px">0/0</span></h1>
+        <button class="btn btn-primary" id="ad-folder-btn" onclick="openDetailFolder()" style="margin-bottom:10px;display:none">📁 打开文件夹</button>
+        <div class="progress-bar-wrap">
+          <div class="progress-bar-fill" id="ad-progress-bar" style="width: 0%"></div>
+        </div>
+      </div>
+      <div class="stats-row" style="margin-bottom:16px">
+        <div class="stat-card total"><div class="number" id="ad-total">0</div><div class="label">总人数</div></div>
+        <div class="stat-card submitted"><div class="number" id="ad-done">0</div><div class="label">已提交</div></div>
+        <div class="stat-card not-submitted"><div class="number" id="ad-miss">0</div><div class="label">未提交</div></div>
+        <div class="stat-card rate"><div class="number" id="ad-rate">0%</div><div class="label">提交率</div></div>
+      </div>
+      <div class="section-title"> 未提交学生</div>
+      <div class="student-grid" id="ad-missing-grid"></div>
+      <div class="section-title" style="margin-top:20px"> 已提交学生</div>
+      <div class="student-grid" id="ad-done-grid"></div>
+      <!-- 模板模块 -->
+      <div class="template-section" id="ad-template-section">
+        <div class="section-title">
+          <span>📌 作业模板</span>
+          <span style="flex:1"></span>
+          <button class="btn btn-ghost" onclick="triggerTemplateUpload()" style="font-size:11px;padding:4px 12px">+ 添加模板</button>
+          <input type="file" id="template-file-input" accept=".docx,.doc" style="display:none" onchange="handleTemplateUpload(this)">
+        </div>
+        <div id="ad-template-list">加载中...</div>
+      </div>
+    </div>
+
+    <!-- Assignment List View -->
+    <div id="assignment-list">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <div class="section-title" style="margin:0"> 科目作业总览（自动同步作业目录）</div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-primary" onclick="showAddAssignment()">+ 添加作业</button>
+          <button class="btn btn-ghost" onclick="rescanAll(event)">🔄 重新扫描</button>
+        </div>
+      </div>
+
+      <!-- Add Assignment Form -->
+      <div id="add-assignment-form" class="management-section hidden">
+        <h3> 添加新作业</h3>
+        <div class="add-form" style="flex-wrap:wrap">
+          <input type="text" id="new-as-name" placeholder="作业名称 *" style="flex:2;min-width:180px">
+          <input type="text" id="new-as-subject" placeholder="科目（选已有的或输入新的）" style="flex:2;min-width:180px" list="subject-suggestions">
+          <input type="text" id="new-as-keywords" placeholder="作业关键词，用逗号分隔，可选" style="flex:2;min-width:220px">
+
+          <datalist id="subject-suggestions"></datalist>
+          <button class="btn btn-primary" onclick="addAssignment()">确认添加</button>
+          <button class="btn btn-ghost" onclick="document.getElementById('add-assignment-form').classList.add('hidden')">取消</button>
+        </div>
+      </div>
+      <!-- Subject Group Cards -->
+      <div id="subject-group-cards"></div>
+    </div>
+  </div>
+
+  <!-- Management Tab -->
+  <div id="tab-manage" class="hidden manage-container">
+    <!-- 添加学生 -->
+    <div class="mgmt-card mgmt-expanded">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▾</span>
+        <h3>➕ 添加学生</h3>
+      </div>
+      <div class="mgmt-body">
+        <div class="add-form">
+          <input type="text" id="add-name" placeholder="姓名 *" onkeydown="if(event.key==='Enter')addStudent()">
+          <input type="text" id="add-id" placeholder="学号（可选）" onkeydown="if(event.key==='Enter')addStudent()">
+          <input type="text" id="add-pinyin" placeholder="拼音（可选，如 zhangsan）" onkeydown="if(event.key==='Enter')addStudent()">
+          <button class="btn btn-primary" onclick="addStudent()">添加</button>
+        </div>
+        <div class="mgmt-hint">系统通过文件名匹配学生。文件包含姓名或学号即可自动识别。</div>
+      </div>
+    </div>
+
+    <!-- 学生名单 -->
+    <div class="mgmt-card mgmt-expanded">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▾</span>
+        <h3>👥 学生名单 <span class="mgmt-count" id="student-count">0</span><span class="mgmt-unit">人</span></h3>
+        <input type="text" id="student-search" placeholder="搜索..." class="mgmt-search" onclick="event.stopPropagation()" oninput="filterStudentTags()">
+      </div>
+      <div class="mgmt-body">
+        <div class="student-list-tags" id="student-tags"></div>
+      </div>
+    </div>
+
+    <!-- 批量导入 -->
+    <div class="mgmt-card">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▸</span>
+        <h3>📋 批量导入</h3>
+      </div>
+      <div class="mgmt-body">
+        <textarea id="bulk-input" class="mgmt-textarea" oninput="previewBulkImport()" placeholder="每行一个学生，格式：姓名,学号,拼音(可选)
+示例：
+张三,2024001,zhangsan
+李四,2024002,lisi"></textarea>
+        <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+          <button class="btn btn-primary" onclick="bulkImport()">导入</button>
+          <span id="bulk-preview" style="font-size:12px;color:var(--text-secondary)"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 截止日期设置 -->
+    <div class="mgmt-card mgmt-expanded">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▾</span>
+        <h3>⏰ 截止日期设置</h3>
+      </div>
+      <div class="mgmt-body">
+        <div class="mgmt-hint" style="margin-bottom:10px">为每个科目设置统一的截止日期和备注，仪表盘会显示倒计时</div>
+        <div id="due-settings-list"></div>
+        <button class="btn btn-primary" onclick="saveAllDue()" style="margin-top:10px">💾 保存全部</button>
+      </div>
+    </div>
+
+    <!-- 关键词 -->
+    <div class="mgmt-card">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▸</span>
+        <h3>🔑 文件识别关键词 <span class="mgmt-count" id="keyword-count">0</span></h3>
+      </div>
+      <div class="mgmt-body">
+        <div class="mgmt-hint" style="margin-bottom:8px">只识别文件名中含以下关键词的文件，避免图片/语音等无关文件干扰</div>
+        <div class="add-form">
+          <input type="text" id="keyword-input" placeholder="输入新关键词，如：作业、报告" onkeydown="if(event.key==='Enter')addKeyword()">
+          <button class="btn btn-primary" onclick="addKeyword()">添加</button>
+        </div>
+        <div class="student-list-tags" id="keyword-tags"></div>
+      </div>
+    </div>
+
+    <!-- 作业关键词 -->
+    <div class="mgmt-card mgmt-tall">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▸</span>
+        <h3>🎯 作业关键词 <span class="mgmt-count" id="assignment-keyword-count">0</span></h3>
+      </div>
+      <div class="mgmt-body">
+        <div class="mgmt-hint" style="margin-bottom:8px">为每个作业设置自己的匹配词，用来把文件归到正确作业；多个关键词用逗号、顿号或分号分隔。</div>
+        <div id="assignment-keyword-settings"></div>
+        <button class="btn btn-primary" onclick="saveAssignmentKeywords()" style="margin-top:10px">💾 保存作业关键词</button>
+      </div>
+    </div>
+
+    <!-- 文件存放路径 -->
+    <div class="mgmt-card">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▸</span>
+        <h3>📁 文件存放路径</h3>
+      </div>
+      <div class="mgmt-body">
+        <div style="font-size:13px;color:var(--text-secondary);line-height:1.8">
+          <p>收到文件自动整理到：</p>
+          <div style="display:flex;align-items:center;gap:6px;margin:6px 0">
+            <code style="flex:1;background:var(--bg);padding:6px 10px;border-radius:6px;font-size:12px" id="copy-path">桌面\班级文件夹\已收作业\</code>
+            <button class="btn btn-ghost btn-icon" onclick="navigator.clipboard.writeText(document.getElementById('copy-path').textContent)" title="复制路径" style="font-size:11px">📋</button>
+          </div>
+          <p>下级目录按 <strong>科目</strong> → <strong>学生姓名</strong> 自动创建：</p>
+          <p style="font-family:monospace;background:var(--bg);padding:6px 10px;border-radius:6px;margin:6px 0;font-size:12px;line-height:2">
+            已收作业/<br>
+            &nbsp;&nbsp;├─ 课程报告/张三/xxx.docx<br>
+            &nbsp;&nbsp;├─ 项目作业/李四/xxx.pdf<br>
+            &nbsp;&nbsp;└─ ...
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- 公示文件夹 -->
+    <div class="mgmt-card">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▸</span>
+        <h3>📢 公示文件夹</h3>
+      </div>
+      <div class="mgmt-body">
+        <div class="mgmt-hint" style="margin-bottom:8px">同学交到公示文件夹的文件会自动入库，也可手动回填历史文件到已收作业</div>
+        <label style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px;padding:10px 12px;border:1px solid var(--card-border);border-radius:8px;background:var(--bg);font-size:13px;color:var(--text-secondary)">
+          <span><strong style="color:var(--text)">启用公示文件夹</strong><br>关闭时停止双写和回填；确认后会删除桌面上的公示文件夹。</span>
+          <input type="checkbox" id="experiment-enabled-toggle" onchange="toggleExperimentEnabledClassic(this.checked)" style="width:auto">
+        </label>
+        <div class="add-form">
+          <input type="text" id="experiment-dir-input" placeholder="公示文件夹路径" onkeydown="if(event.key==='Enter')saveExperimentDir()">
+          <button class="btn btn-primary" onclick="saveExperimentDir()">保存</button>
+        </div>
+        <button class="btn btn-primary" style="margin-top:8px;width:100%" onclick="rescanExperiment()">🔄 从公示目录回填已收作业</button>
+        <button class="btn" style="margin-top:8px;width:100%;background:#d9534f;color:#fff;border-color:#c9302c" onclick="deleteExperimentDirClassic()">🗑 删除公示文件夹</button>
+        <div id="experiment-rescan-msg" style="font-size:12px;color:var(--text-secondary);margin-top:6px"></div>
+      </div>
+    </div>
+
+    <!-- 文件扫描队列 -->
+    <div class="mgmt-card mgmt-expanded">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▾</span>
+        <h3>📂 文件扫描队列 <span class="mgmt-count" id="scan-dir-count">0</span></h3>
+      </div>
+      <div class="mgmt-body">
+        <div class="mgmt-hint" style="margin-bottom:8px">添加文件夹到扫描队列，"扫描已有文件"会自动遍历所有队列中的目录</div>
+        <div class="add-form">
+          <input type="text" id="scan-dir-input" placeholder="输入任意文件夹路径，如 ~/Documents/作业" onkeydown="if(event.key==='Enter')addScanDir()">
+          <button class="btn btn-primary" onclick="addScanDir()">添加</button>
+        </div>
+        <div class="mgmt-hint" id="runtime-capability-note" style="margin:8px 0"></div>
+        <div class="student-list-tags" id="scan-dir-tags"></div>
+      </div>
+    </div>
+
+    <!-- 现代版入口 -->
+    <div class="mgmt-card">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▸</span>
+        <h3>🎨 现代版前端</h3>
+        <div style="display:flex;gap:8px;margin-left:auto;" onclick="event.stopPropagation()">
+          <button class="btn btn-primary" onclick="openModernFrontend()" style="font-size:11px;padding:4px 10px">打开现代版</button>
+        </div>
+      </div>
+      <div class="mgmt-body">
+        <div class="mgmt-hint">主题预设、现代视觉和新版管理体验都在现代版前端中调整；旧版这里只保留跳转入口，避免重复配置。</div>
+      </div>
+    </div>
+
+    <!-- 系统更新 -->
+    <div class="mgmt-card">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▸</span>
+        <h3>🔄 系统更新</h3>
+      </div>
+      <div class="mgmt-body">
+        <div style="font-size:13px;color:var(--text-secondary);line-height:1.8">
+          <p>检查 GitHub 最新版本，或手动加载 <code>.zip</code> 更新包；系统将自动备份、更新并重启。</p>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0">
+            <button class="btn btn-primary" onclick="checkGithubUpdate()">检查 GitHub 更新</button>
+            <button class="btn" id="github-update-download" onclick="downloadGithubUpdate()" disabled>下载并加载最新版本</button>
+          </div>
+          <div id="github-update-result" style="font-size:12px;color:var(--text-secondary);margin:8px 0">当前版本检查尚未执行。</div>
+          <div id="update-drop-zone" style="
+            border:2px dashed #3a3d50; border-radius:12px; padding:30px; text-align:center;
+            margin:10px 0; cursor:pointer; transition:all 0.2s; background:var(--bg);
+          " onclick="document.getElementById('update-file-input').click()">
+            <div style="font-size:32px;margin-bottom:8px">📦</div>
+            <div style="font-size:14px;color:var(--text-primary)">拖拽更新包到此处</div>
+            <div style="font-size:12px;color:var(--text-secondary);margin-top:4px">或点击选择文件</div>
+            <input type="file" id="update-file-input" accept=".zip" style="display:none" onchange="handleUpdateFileSelect(event)">
+          </div>
+          <div id="update-progress" class="hidden" style="margin:10px 0">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+              <div class="spinner" style="width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin 0.8s linear infinite"></div>
+              <span id="update-status-text" style="font-size:13px">正在处理...</span>
+            </div>
+            <div style="background:var(--bg);border-radius:6px;height:6px;overflow:hidden">
+              <div id="update-progress-bar" style="height:100%;background:var(--primary);width:0%;transition:width 0.3s"></div>
+            </div>
+          </div>
+          <div id="update-result" class="hidden" style="margin:10px 0;padding:10px;border-radius:8px;font-size:13px"></div>
+          <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
+            <div style="display:flex;align-items:center;justify-content:space-between">
+              <span style="font-size:12px;color:var(--text-secondary)">📋 更新日志</span>
+              <button class="btn btn-ghost btn-icon" onclick="loadChangelog()" style="font-size:11px" title="刷新">🔄</button>
+            </div>
+            <div id="update-changelog-preview" style="font-size:12px;color:var(--text-secondary);margin-top:6px;max-height:150px;overflow-y:auto;line-height:1.6">
+              <span style="color:var(--text-tertiary)">点击刷新加载...</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="management-section">
+      <h3> 微信设置提醒</h3>
+      <div style="font-size:13px;color:var(--text-secondary);line-height:1.8">
+        <p>为确保文件能被自动检测，请确认微信PC端已开启以下设置：</p>
+        <p>1. 微信 → 设置 → 通用设置 → <strong>文件管理</strong></p>
+        <p>2. 确保「<strong>文件自动下载</strong>」已勾选</p>
+        <p style="margin-top:8px;color:var(--yellow);">⚠ 未开启自动下载时，别人发的文件不会存到本地，无法被监控到。</p>
+      </div>
+    </div>
+
+    <div class="mgmt-card mgmt-expanded">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▾</span><h3>🌐 访问模式</h3><span class="mgmt-count" id="classic-network-pill">检测中</span>
+      </div>
+      <div class="mgmt-body">
+        <label style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border:1px solid var(--card-border);border-radius:8px;background:var(--bg);font-size:13px">
+          <span><strong>允许局域网访问</strong><br><span style="color:var(--text-secondary)">关闭时仅本机可用；开启后远程设备需要访问口令。</span></span>
+          <input type="checkbox" id="classic-lan-toggle" onchange="toggleLanAccessClassic(this.checked)" style="width:auto">
+        </label>
+        <div id="classic-lan-urls" class="mgmt-hint" style="margin-top:8px"></div>
+        <div class="add-form" style="margin-top:8px">
+          <input id="classic-lan-token" type="password" readonly placeholder="开启后生成访问口令">
+          <button class="btn" onclick="toggleClassicLanToken()">显示</button>
+          <button class="btn btn-primary" onclick="copyClassicLanInfo()">复制</button>
+        </div>
+        <button class="btn" id="classic-lan-reset" style="margin-top:8px" onclick="regenerateLanTokenClassic()">重新生成口令</button>
+        <div id="classic-network-note" class="mgmt-hint" style="margin-top:8px">仅适合可信私人网络，请勿做公网端口映射。</div>
+      </div>
+    </div>
+
+    <!-- 公告管理（仅管理员） -->
+    <div class="mgmt-card admin-only" style="display:none">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▸</span>
+        <h3>📢 公告管理</h3>
+        <div style="display:flex;gap:8px;margin-left:auto;" onclick="event.stopPropagation()">
+          <button class="btn btn-ghost" onclick="loadExistingAnnouncements()" style="font-size:11px;padding:4px 10px">📂 加载已有公告</button>
+          <button class="btn btn-primary" onclick="exportAnnouncementFile()" style="font-size:11px;padding:4px 10px">📥 导出公告</button>
+        </div>
+      </div>
+      <div class="mgmt-body">
+        <div class="ann-form-row">
+          <div style="margin-bottom:10px">
+            <label style="font-size:12px;color:var(--text-secondary)">公告标题 *</label>
+            <input type="text" id="annTitle" placeholder="例如：v2.0.0 重大更新" style="width:100%;padding:8px 12px;border-radius:8px;border:1px solid var(--card-border);background:var(--bg);color:var(--text);font-size:13px;margin-top:4px">
+          </div>
+          <div style="margin-bottom:10px">
+            <label style="font-size:12px;color:var(--text-secondary)">公告类型</label>
+            <select id="annType" style="width:100%;padding:8px 12px;border-radius:8px;border:1px solid var(--card-border);background:var(--bg);color:var(--text);font-size:13px;margin-top:4px">
+              <option value="changelog">更新日志 (Changelog)</option>
+              <option value="notice">普通公告 (Notice)</option>
+              <option value="urgent">紧急通知 (Urgent)</option>
+            </select>
+          </div>
+        </div>
+        <div class="ann-form-row">
+          <div style="margin-bottom:10px">
+            <label style="font-size:12px;color:var(--text-secondary)">版本号</label>
+            <input type="text" id="annVersion" placeholder="例如：2.0.0" style="width:100%;padding:8px 12px;border-radius:8px;border:1px solid var(--card-border);background:var(--bg);color:var(--text);font-size:13px;margin-top:4px">
+          </div>
+          <div style="margin-bottom:10px">
+            <label style="font-size:12px;color:var(--text-secondary)">发布者</label>
+            <input type="text" id="annAuthor" value="系统管理员" style="width:100%;padding:8px 12px;border-radius:8px;border:1px solid var(--card-border);background:var(--bg);color:var(--text);font-size:13px;margin-top:4px">
+          </div>
+        </div>
+        <div style="margin-bottom:10px">
+          <label style="font-size:12px;color:var(--text-secondary)">公告内容（Markdown）*</label>
+          <textarea id="annContent" placeholder="## 更新内容&#10;&#10;### 新增功能&#10;- 功能A&#10;- 功能B&#10;&#10;### 修复问题&#10;- 修复了..." style="width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--card-border);background:var(--bg);color:var(--text);font-family:'Consolas',monospace;font-size:13px;line-height:1.7;resize:vertical;min-height:200px;margin-top:4px"></textarea>
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:12px">
+          <button class="btn btn-primary" onclick="publishToList()" style="font-size:12px">📝 添加到公告列表</button>
+          <button class="btn btn-ghost" onclick="clearAnnForm()" style="font-size:12px">🗑️ 清空表单</button>
+        </div>
+        <h4 style="font-size:13px;color:var(--text-secondary);margin-bottom:8px">👁️ 实时预览</h4>
+        <div class="ann-preview-panel" id="annPreview">
+          <em style="color:var(--text-secondary);opacity:0.6">在左侧输入内容后此处显示预览</em>
+        </div>
+        <h4 style="font-size:13px;color:var(--text-secondary);margin:12px 0 8px">📂 拖入公告文件预览/导入</h4>
+        <div id="ann-import-drop-zone" style="border:2px dashed #3a3d50;border-radius:10px;padding:18px;text-align:center;background:var(--bg);cursor:pointer;transition:all .2s" onclick="document.getElementById('ann-import-input').click()">
+          <div style="font-size:24px;margin-bottom:6px">📄</div>
+          <div style="font-size:13px;color:var(--text)">拖入 announcement.json</div>
+          <div style="font-size:12px;color:var(--text-secondary);margin-top:3px">用于预览旧公告或导入到当前公告列表</div>
+          <input type="file" id="ann-import-input" accept=".json" style="display:none" onchange="handleAnnouncementImportSelect(event)">
+        </div>
+        <div id="ann-import-preview" style="margin-top:8px;font-size:12px;color:var(--text-secondary)"></div>
+        <h4 style="font-size:13px;color:var(--text-secondary);margin:12px 0 8px">📋 公告列表 (<span id="annListCount">0</span>)</h4>
+        <div id="announcementHistoryList">
+          <div style="text-align:center;padding:30px;color:var(--text-secondary);font-size:13px">
+            暂无公告，请在左侧编辑并点击"添加到公告列表"
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 更新包生成（仅管理员） -->
+    <div class="mgmt-card admin-only" style="display:none">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▸</span>
+        <h3>📦 一键生成更新包</h3>
+      </div>
+      <div class="mgmt-body">
+        <div style="font-size:13px;color:var(--text-secondary);line-height:1.8;margin-bottom:12px">
+          将当前代码和当前公告列表打包成 <code>.zip</code>，发给别人后可直接拖到「系统更新」区域更新。
+        </div>
+        <div class="ann-form-row">
+          <div style="margin-bottom:10px">
+            <label style="font-size:12px;color:var(--text-secondary)">更新版本号 *</label>
+            <input type="text" id="pkgVersion" placeholder="例如：1.3.0" oninput="updatePackageSummary()" style="width:100%;padding:8px 12px;border-radius:8px;border:1px solid var(--card-border);background:var(--bg);color:var(--text);font-size:13px;margin-top:4px">
+          </div>
+          <div style="margin-bottom:10px">
+            <label style="font-size:12px;color:var(--text-secondary)">将包含</label>
+            <div id="pkgSummary" style="padding:8px 12px;border-radius:8px;border:1px solid var(--card-border);background:var(--bg);color:var(--text-secondary);font-size:13px;margin-top:4px">公告 0 条 · 等待填写版本号</div>
+          </div>
+        </div>
+        <div style="font-size:12px;color:var(--text-secondary);line-height:1.8;margin-bottom:10px">这里只填写更新版本号；更新说明请在公告管理中作为公告或更新日志发布。</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-ghost" onclick="previewCurrentAnnouncements()" style="font-size:12px">👁️ 预览公告弹窗</button>
+          <button class="btn btn-primary" onclick="buildUpdatePackage()" style="font-size:12px">📦 一键生成更新包</button>
+        </div>
+        <div id="pkgBuildResult" style="margin-top:10px;font-size:13px;color:var(--text-secondary)"></div>
+      </div>
+    </div>
+
+    <!-- 服务器控制（仅管理员） -->
+    <div class="mgmt-card admin-only" style="display:none">
+      <div class="mgmt-header" onclick="this.parentElement.classList.toggle('mgmt-expanded')">
+        <span class="mgmt-toggle">▸</span>
+        <h3>🖥 服务器控制</h3>
+        <span id="server-status-badge" style="margin-left:auto;font-size:12px;padding:2px 10px;border-radius:12px;background:#555;color:#fff">检查中...</span>
+      </div>
+      <div class="mgmt-body">
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-primary" id="btn-restart-server" onclick="restartServer()" style="flex-shrink:0">🔄 重启服务器</button>
+          <button class="btn" id="btn-shutdown-server" onclick="shutdownServer()" style="flex-shrink:0;background:#d9534f;color:#fff;border-color:#c9302c">⏻ 关闭服务器</button>
+        </div>
+        <div id="server-control-msg" style="margin-top:10px;font-size:13px;color:var(--text-secondary)"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Student Detail Popup -->
+  <div class="modal-overlay hidden" id="student-popup" onclick="closeStudentPopup()">
+    <div class="modal" style="max-width:640px" onclick="event.stopPropagation()">
+      <span class="close" onclick="closeStudentPopup()">✕</span>
+      <h3 id="popup-name">学生详情</h3>
+      <div style="font-size:13px;color:var(--text-secondary);margin-bottom:16px" id="popup-id"></div>
+      <div id="popup-assignments"></div>
+    </div>
+  </div>
+
+  <!-- DOCX to PDF Convert Modal -->
+  <div class="modal-overlay hidden" id="convert-modal" onclick="closeConvertModal(event)">
+    <div class="modal convert-modal" onclick="event.stopPropagation()">
+      <span class="close" onclick="closeConvertModal()">✕</span>
+      <h3>🔄 docx → PDF 转换</h3>
+      <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">选择本地 .docx 文件进行转换，转换后的 PDF 可逐个下载或打包下载</p>
+
+      <!-- 拖放上传区 -->
+      <div class="convert-dropzone" id="convert-dropzone" onclick="document.getElementById('convert-file-input').click()">
+        <div class="dz-icon">📄</div>
+        <div class="dz-text">点击选择文件或拖拽到此处</div>
+        <div class="dz-hint">支持 .docx 格式，可一次选择多个文件</div>
+      </div>
+      <input type="file" id="convert-file-input" accept=".docx" multiple style="display:none" onchange="handleConvertFileSelect(this)">
+
+      <!-- 已选文件列表 -->
+      <div class="convert-file-list" id="convert-file-list"></div>
+
+      <!-- 操作按钮 -->
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+        <button class="btn btn-primary" id="convert-start-btn" onclick="startConvert()" disabled>⚡ 开始转换</button>
+        <span style="font-size:12px;color:var(--text-secondary)" id="convert-file-count">未选择文件</span>
+      </div>
+
+      <!-- 转换结果 -->
+      <div class="convert-result-area hidden" id="convert-result-area">
+        <div class="convert-summary" id="convert-summary"></div>
+        <div id="convert-results"></div>
+        <div style="margin-top:12px;display:flex;gap:8px">
+          <button class="btn-download-all" id="btn-download-all" onclick="downloadAllZip()" disabled>📦 下载全部 ZIP</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 文件预览面板 -->
+  <div class="preview-panel" id="preview-panel">
+    <div class="preview-header">
+      <span class="preview-title" id="preview-title">📄 文件预览</span>
+      <button class="preview-close" onclick="closePreview()" title="关闭预览">✕</button>
+    </div>
+    <div class="preview-body" id="preview-body">
+      <div class="preview-empty">点击 👁 预览按钮查看文件内容</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Toast 提示 -->
+<div class="toast" id="toast"></div>
+
+<script src="/static/classic.js"></script>
+
+</body>
+</html>

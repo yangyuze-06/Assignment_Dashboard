@@ -1,6 +1,6 @@
 # Assignment_Dashboard
 
-一个面向班委、学委、课代表和老师的 Windows 本地作业分类与提交追踪工具。
+一个面向班委、学委、课代表和老师的本地作业分类与提交追踪工具。Windows 提供安装程序，macOS/Linux 支持源码运行。
 
 Assignment_Dashboard 主要用于监控微信接收的作业文件，同时允许用户自由添加其他本地监听目录。系统会根据学生姓名、课程规则和作业批次整理提交文件，并在本地网页中展示提交进度、未提交名单、待归档文件和最近记录。
 
@@ -58,11 +58,13 @@ Assignment_Dashboard 主要用于监控微信接收的作业文件，同时允�
 - 确认或拒绝待确认别名
 - 导入、导出和合并专业规则包
 - 查看科目修正记忆和非本作业反馈
-- 使用文件名样本辅助整理新课程关键词
+- 使用历史记录、文件/文件夹或粘贴的文件名批量生成候选样本
+- 在拆解预览中确认课程和具体作业后加入本地样本库
+- 可选启用纯 Python 本地小模型，并查看各课程的样本覆盖与训练状态
 
-新科目训练向导只处理用户选择文件的文件名，不读取或上传文件正文。未知课程和冲突结果不会直接自动归档。
+训练样本不是必填项；零样本时系统保持原有规则分类行为。本地学习只处理文件名，不读取或上传文件正文。未知课程、标签冲突和低置信度结果不会直接自动归档。
 
-## 下载与安装
+## 下载与安装（Windows）
 
 推荐从项目的 [Releases](https://github.com/Trip1eY/Assignment_Dashboard/releases) 页面下载最新安装程序。
 
@@ -76,23 +78,41 @@ Assignment_Dashboard 主要用于监控微信接收的作业文件，同时允�
 
 > 安装程序暂未进行商业代码签名，Windows 可能显示“未知发布者”或 SmartScreen 提示。请只从本项目 GitHub Releases 页面下载。
 
+> macOS 当前支持源码运行，暂不提供 `.app`、`.dmg` 或图形化安装包。
+
 ## 从源码运行
 
 需要自行运行源码时，请先安装 Python 3.10 或更高版本，推荐 Python 3.12。
 
-```batch
+```bash
 git clone https://github.com/Trip1eY/Assignment_Dashboard.git
 cd Assignment_Dashboard
-python server.py
+python3 -m pip install -r requirements.txt
 ```
 
-文档预览相关可选依赖：
+macOS/Linux：
+
+```bash
+chmod +x start.sh
+./start.sh
+```
+
+需要关闭终端后继续运行时：
+
+```bash
+./start.sh --background
+```
+
+后台日志保存在 `logs/dashboard.log`。普通 `./start.sh` 是前台运行，按 `Ctrl+C` 会正常停止；关闭终端通常也会终止前台服务。
+
+Windows 源码运行：
 
 ```batch
-pip install python-docx PyPDF2 pywin32
+python -m pip install -r requirements.txt
+python py/server.py
 ```
 
-缺少可选依赖不会影响基础统计和文件分类，但部分 Word、PDF 文本解析或预览功能可能降级。
+`python-docx` 和 `PyPDF2` 用于文档文本提取；Windows 的 `pywin32` 由 `requirements.txt` 按平台安装。缺少可选依赖不会影响基础统计和文件分类。
 
 ## 打开仪表盘
 
@@ -174,6 +194,27 @@ http://localhost:18765/modern      现代版
 - 转换工具不可用时会降级为文本预览，并保留打开原文件的入口。
 - 已转换文档会使用本地缓存，提高再次预览速度。
 
+macOS 没有 Microsoft Word COM 转换能力，DOCX/DOC 排版预览依赖 LibreOffice。没有安装 LibreOffice 时，PDF 和图片预览仍可使用，Word 文档会尝试降级为文本内容或提示直接打开原文件。LibreOffice 不是运行基础分类功能的必需依赖，但需要 Word 排版预览的 macOS 用户应安装：
+
+```bash
+brew install --cask libreoffice
+```
+
+设置页会显示当前是否检测到 LibreOffice；未检测到时会提示“未检测到 LibreOffice，Word 文档转换和预览功能可能不可用。”压缩包可以被监听、归档、下载或交给系统应用打开，但当前不提供压缩包内部内容预览。
+
+## macOS 微信目录与权限
+
+系统会尝试识别普通安装版、沙盒容器和 Group Container 中的微信 4.x 目录，包括 `Data/Documents/xwechat_files`。如果未自动识别，可以在管理页“文件扫描队列”中粘贴任意本地文件夹路径。
+
+若目录存在但页面监听不到文件：
+
+1. 打开“系统设置 → 隐私与安全性”。
+2. 检查“文件与文件夹”及“完全磁盘访问权限”。
+3. 给实际启动程序授权，例如 Terminal、iTerm、Python 或打包后的应用。
+4. 完全退出并重新启动终端和作业追踪器，再执行一次“立即扫描”。
+
+程序会拒绝添加不存在、不是文件夹或当前不可读取的路径，并在设置页显示权限排查提示。授权只需要覆盖用户主动选择的微信/作业目录。
+
 在管理页的“文件预览预热”中，可以开启“启动时自动预热”，也可以随时点击“立即预热”。预热优先处理最近 20 个仪表盘 Word 文件，并从已收作业和已启用的公示文件夹补足，不遍历全部微信历史。Word 转换运行在隐藏隔离进程中，宏、提醒和最近文件记录会被关闭；单个异常文件超过时限后会终止本次转换，不会阻塞服务器或自动打开原文件。
 
 ## 本机与局域网访问
@@ -200,6 +241,14 @@ http://localhost:18765/modern      现代版
 - 手动选择本地 ZIP 更新包
 
 更新前会自动备份当前程序和运行数据。更新失败时会尝试自动回滚。
+
+更新包会按目标平台包含启动文件：Windows 使用 `.bat`，macOS/Linux 使用 `start.sh`。服务更新后由 Python 接力进程等待旧端口释放，再启动新进程。离线修复命令为：
+
+```bash
+python3 py/repair_update.py /完整路径/dashboard_update_v版本.zip
+```
+
+离线更新默认停止旧服务、应用更新并自动重启；使用 `--no-restart` 可以只更新不重启。
 
 无法访问 GitHub 时，可以从 Releases 页面手动下载更新包，再在系统更新模块中加载。
 
@@ -240,14 +289,14 @@ http://localhost:18765/modern      现代版
 
 ### 更新失败怎么办
 
-系统会在更新前创建备份并尝试自动回滚。如果服务没有自动恢复，可以关闭启动窗口后重新运行“启动作业追踪器.bat”，或使用安装目录中的更新修复工具。
+系统会在更新前创建备份并尝试自动回滚。如果服务没有自动恢复，Windows 可重新运行“启动作业追踪器.bat”或更新修复工具；macOS/Linux 可运行 `./start.sh`，也可使用 `python3 py/repair_update.py 更新包.zip` 离线修复。
 
 ## 反馈与交流
 
 - 在 [Discussions](https://github.com/Trip1eY/Assignment_Dashboard/discussions) 交流使用体验和改进想法。
 - 在 [Issues](https://github.com/Trip1eY/Assignment_Dashboard/issues/new/choose) 报告问题或提交功能建议。
 
-反馈时建议说明 Windows 版本、操作步骤、错误提示和相关截图，但请不要附带真实学生信息、作业文件或访问口令。
+反馈时建议说明操作系统及版本、Python 版本、操作步骤、错误提示和相关截图，但请不要附带真实学生信息、作业文件或访问口令。
 
 ## 许可证
 

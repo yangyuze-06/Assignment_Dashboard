@@ -13,18 +13,45 @@ import zipfile
 import datetime
 import shutil
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PY_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(PY_DIR)
+BUGFIX_REQUIRED_FILES = (
+    "py/launcher.py",
+    "py/server.py",
+    "html/dashboard.html",
+    "html/dashboard_modern.html",
+    "html/static/classic.css",
+    "html/static/classic.js",
+    "html/static/modern.css",
+    "html/static/modern.js",
+)
+LEGACY_UPDATE_ALIASES = {
+    "server.py": "py/launcher.py",
+    "dashboard.html": "html/dashboard.html",
+    "dashboard_modern.html": "html/dashboard_modern.html",
+    "static/classic.css": "html/static/classic.css",
+    "static/classic.js": "html/static/classic.js",
+    "static/modern.css": "html/static/modern.css",
+    "static/modern.js": "html/static/modern.js",
+}
 
 # 打包配置
 PACK_CONFIG = {
     "include_files": [
-        "server.py",
-        "ai_classifier.py",
-        "restart_helper.py",
-        "dashboard.html",
-        "dashboard_modern.html",
-        "pack.py",
-        "repair_update.py",
+        "py/launcher.py",
+        "py/server.py",
+        "py/ai_classifier.py",
+        "py/classifier_features.py",
+        "py/classifier_trainer.py",
+        "py/restart_helper.py",
+        "html/dashboard.html",
+        "html/dashboard_modern.html",
+        "html/static/classic.css",
+        "html/static/classic.js",
+        "html/static/modern.css",
+        "html/static/modern.js",
+        "py/pack.py",
+        "py/repair_update.py",
         "requirements.txt",
         "repair_update.bat",
         "启动作业追踪器.bat",
@@ -45,6 +72,20 @@ PACK_CONFIG = {
     ],
     "output_dir": "releases"
 }
+
+WINDOWS_UPDATE_FILES = {"repair_update.bat", "启动作业追踪器.bat", "更新修复工具.bat"}
+UNIX_UPDATE_FILES = {"start.sh"}
+
+
+def files_for_platform(file_list, target_platform=None):
+    """Filter launch/repair scripts so an update package only carries its target platform."""
+    target = (target_platform or sys.platform).lower()
+    files = list(file_list)
+    if target in ("all", "universal"):
+        return files
+    if target.startswith("win"):
+        return [name for name in files if name not in UNIX_UPDATE_FILES]
+    return [name for name in files if name not in WINDOWS_UPDATE_FILES]
 
 
 def get_version():
@@ -81,7 +122,7 @@ def should_exclude(name, patterns):
     return False
 
 
-def create_update_package(version=None, file_list=None, output_name=None):
+def create_update_package(version=None, file_list=None, output_name=None, target_platform=None):
     """
     创建更新ZIP包
     
@@ -97,6 +138,8 @@ def create_update_package(version=None, file_list=None, output_name=None):
     
     if file_list is None:
         file_list = PACK_CONFIG["include_files"]
+    resolved_platform = target_platform or sys.platform
+    file_list = files_for_platform(file_list, resolved_platform)
     
     # 输出目录
     output_dir = os.path.join(BASE_DIR, PACK_CONFIG["output_dir"])
@@ -155,6 +198,14 @@ def create_update_package(version=None, file_list=None, output_name=None):
                             files_added += 1
             else:
                 print(f"  ! {fname} 不存在，跳过")
+
+        for legacy_name, source_name in LEGACY_UPDATE_ALIASES.items():
+            if source_name not in file_list:
+                continue
+            source_path = os.path.join(BASE_DIR, source_name)
+            if os.path.isfile(source_path):
+                zf.write(source_path, legacy_name)
+                files_added += 1
         
         # 添加公告文件（如果存在）
         ann_path = os.path.join(BASE_DIR, "announcement.json")
@@ -170,8 +221,12 @@ def create_update_package(version=None, file_list=None, output_name=None):
         manifest = {
             "app": "Assignment_Dashboard",
             "version": str(version),
+            "platform": resolved_platform,
             "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "files": [name for name in file_list if name != "manifest.json"],
+            "files": [name for name in file_list if name != "manifest.json"] + [
+                legacy_name for legacy_name, source_name in LEGACY_UPDATE_ALIASES.items()
+                if source_name in file_list
+            ],
             "has_announcement": os.path.exists(ann_path),
         }
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -196,12 +251,12 @@ def create_update_package(version=None, file_list=None, output_name=None):
     return zip_path
 
 
-def create_bugfix_package(fix_files, version=None):
+def create_bugfix_package(fix_files, version=None, target_platform=None):
     """
-    创建Bug修复更新包（只包含修复的文件）
+    创建Bug修复更新包（修复文件 + 更新器必需文件）
     
     参数:
-        fix_files: 修复的文件列表，如 ["server.py", "dashboard.html"]
+        fix_files: 修复的文件列表，如 ["py/server.py", "html/dashboard.html"]
         version: 版本号
     
     返回: zip_path
@@ -214,8 +269,10 @@ def create_bugfix_package(fix_files, version=None):
     
     print(f"[INFO] 创建Bug修复更新包...")
     print(f"[INFO] 修复文件: {fix_files}")
-    
-    return create_update_package(version, file_list=fix_files, output_name=output_name)
+
+    package_files = list(dict.fromkeys([*BUGFIX_REQUIRED_FILES, *fix_files]))
+    return create_update_package(version, file_list=package_files, output_name=output_name,
+                                 target_platform=target_platform)
 
 
 def list_available_files():
@@ -246,20 +303,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-  python pack.py                           # 默认打包所有文件
-  python pack.py --version 2.0.0           # 指定版本号
-  python pack.py --list                    # 列出可打包文件
-  python pack.py --bugfix server.py dashboard.html  # 创建Bug修复包
-  python pack.py --files server.py config.json       # 打包指定文件
-  python pack.py --output my_update.zip    # 自定义输出文件名
+  python py/pack.py                           # 默认打包所有文件
+  python py/pack.py --version 2.0.0           # 指定版本号
+  python py/pack.py --list                    # 列出可打包文件
+  python py/pack.py --bugfix py/server.py html/dashboard.html  # 创建Bug修复包
+  python py/pack.py --files py/server.py config.json           # 打包指定文件
+  python py/pack.py --output my_update.zip    # 自定义输出文件名
         """
     )
     parser.add_argument("--version", "-v", help="指定版本号（默认从config.json读取）")
     parser.add_argument("--output", "-o", help="自定义输出文件名")
     parser.add_argument("--list", "-l", action="store_true", help="列出所有可打包文件")
-    parser.add_argument("--bugfix", "-b", nargs="+", metavar="FILE", help="创建Bug修复包（只包含指定文件）")
+    parser.add_argument("--bugfix", "-b", nargs="+", metavar="FILE", help="创建Bug修复包（自动补齐更新必需文件）")
     parser.add_argument("--files", "-f", nargs="+", metavar="FILE", help="只打包指定文件")
     parser.add_argument("--dir", "-d", help="输出目录")
+    parser.add_argument("--target-platform", choices=("current", "windows", "macos", "linux", "all"),
+                        default="current", help="更新包目标平台（默认当前平台）")
     
     args = parser.parse_args()
     
@@ -271,14 +330,16 @@ def main():
         return
     
     try:
+        target_platform = sys.platform if args.target_platform == "current" else args.target_platform
         if args.bugfix:
-            create_bugfix_package(args.bugfix, args.version)
+            create_bugfix_package(args.bugfix, args.version, target_platform=target_platform)
         elif args.files:
             output_name = args.output
-            create_update_package(args.version, file_list=args.files, output_name=output_name)
+            create_update_package(args.version, file_list=args.files, output_name=output_name,
+                                  target_platform=target_platform)
         else:
             output_name = args.output
-            create_update_package(args.version, output_name=output_name)
+            create_update_package(args.version, output_name=output_name, target_platform=target_platform)
     except Exception as e:
         print(f"[ERROR] 打包失败: {e}")
         sys.exit(1)

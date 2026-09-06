@@ -13,6 +13,9 @@ import re
 import tempfile
 from pathlib import Path
 
+import classifier_features
+import classifier_trainer
+
 
 SCHEMA_VERSION = 1
 DEFAULT_SETTINGS = {
@@ -20,6 +23,9 @@ DEFAULT_SETTINGS = {
     "sensitivity": 0.70,
     "sensitivity_preset": "balanced",
     "active_semester": "",
+    "priority": "rules_first",
+    "auto_train": True,
+    "class_aliases": [],
 }
 
 GENERIC_WORDS = {
@@ -40,7 +46,7 @@ class RulePackError(ValueError):
 def default_rule_pack():
     return {
         "schema_version": SCHEMA_VERSION,
-        "profile": {"name": "", "major": "", "semester": "", "school": ""},
+        "profile": {"name": "", "major": "", "grade": "", "semester": "", "school": ""},
         "subjects": {},
         "types": {},
     }
@@ -87,7 +93,7 @@ def normalize_rule_pack(payload, allowed_subjects=None):
         raise RulePackError("profile 必须是对象")
     profile = {
         key: _clean_text(raw_profile.get(key), 100)
-        for key in ("name", "major", "semester", "school")
+        for key in ("name", "major", "grade", "semester", "school")
     }
 
     raw_subjects = payload.get("subjects") or {}
@@ -207,19 +213,24 @@ def save_rule_pack(path, payload):
     return normalized
 
 
-def normalize_filename(filename, students=None):
-    text = Path(str(filename or "")).stem.casefold()
-    for student in students or []:
-        values = student.values() if isinstance(student, dict) else [student]
-        for value in values:
-            token = _clean_text(value, 80).casefold()
-            if len(token) >= 2:
-                text = text.replace(token, " ")
-    text = re.sub(r"\b20\d{6,12}\b", " ", text)
-    text = re.sub(r"\b\d{7,14}\b", " ", text)
-    text = re.sub(r"(?:最终版?|最新版|修订版?|副本|copy|final|v\d+(?:\.\d+)*)", " ", text, flags=re.I)
-    text = re.sub(r"[\s_\-—+（）()\[\]【】.,，。]+", " ", text)
-    return text.strip()
+def inspect_filename(filename, students=None, class_name="", class_aliases=None, protected_terms=None):
+    return classifier_features.inspect_filename(
+        filename,
+        students=students,
+        class_name=class_name,
+        class_aliases=class_aliases,
+        protected_terms=protected_terms,
+    )
+
+
+def normalize_filename(filename, students=None, class_name="", class_aliases=None, protected_terms=None):
+    return inspect_filename(
+        filename,
+        students=students,
+        class_name=class_name,
+        class_aliases=class_aliases,
+        protected_terms=protected_terms,
+    )["normalized_text"]
 
 
 def _subject_registry(assignments, rules, subject_synonyms=None):
@@ -242,14 +253,27 @@ def _subject_registry(assignments, rules, subject_synonyms=None):
     return registry
 
 
-def classify_subject(filename, assignments=None, rules=None, feedback=None,
-                     subject_synonyms=None, students=None, sensitivity=0.70):
-    clean = normalize_filename(filename, students)
+def _rules_classify_subject(filename, assignments=None, rules=None, feedback=None,
+                            subject_synonyms=None, students=None, sensitivity=0.70,
+                            class_name="", class_aliases=None, protected_terms=None):
+    clean = normalize_filename(
+        filename,
+        students,
+        class_name=class_name,
+        class_aliases=class_aliases,
+        protected_terms=protected_terms,
+    )
     registry = _subject_registry(assignments or [], rules or default_rule_pack(), subject_synonyms)
 
     feedback_hits = []
     for item in reversed((feedback or {}).get("subject_corrections", [])):
-        token = normalize_filename(item.get("token", ""), students)
+        token = normalize_filename(
+            item.get("token", ""),
+            students,
+            class_name=class_name,
+            class_aliases=class_aliases,
+            protected_terms=protected_terms,
+        )
         subject = _clean_text(item.get("to_subject"), 80)
         if len(token) >= 2 and subject and token in clean:
             feedback_hits.append(subject)
@@ -329,12 +353,230 @@ def classify_subject(filename, assignments=None, rules=None, feedback=None,
     }
 
 
-def extract_keyword_candidates(subject, filenames, students=None):
+def _model_weight(priority):
+    return {
+        "rules_first": 0.25,
+        "balanced": 0.50,
+        "model_first": 0.75,
+    }.get(str(priority or ""), 0.25)
+
+
+def _with_diagnostics(result, parsed, rule_score=0.0, similarity_score=0.0,
+                      model_score=0.0, margin=0.0):
+    return {
+        **result,
+        "normalized_text": parsed.get("normalized_text", ""),
+        "preprocess": parsed,
+        "rule_score": round(float(rule_score or 0.0), 4),
+        "similarity_score": round(float(similarity_score or 0.0), 4),
+        "model_score": round(float(model_score or 0.0), 4),
+        "candidate_margin": round(float(margin or 0.0), 4),
+    }
+
+
+def classify_subject(filename, assignments=None, rules=None, feedback=None,
+                     subject_synonyms=None, students=None, sensitivity=0.70,
+                     class_name="", class_aliases=None, examples=None,
+                     model_bundle=None, priority="rules_first"):
+    rules = rules or default_rule_pack()
+    registry = _subject_registry(assignments or [], rules, subject_synonyms)
+    protected_terms = []
+    for subject, data in registry.items():
+        protected_terms.append(subject)
+        protected_terms.extend(data.get("aliases", []))
+        protected_terms.extend(data.get("keywords", []))
+    parsed = inspect_filename(
+        filename,
+        students=students,
+        class_name=class_name,
+        class_aliases=class_aliases,
+        protected_terms=protected_terms,
+    )
+    clean = parsed["normalized_text"]
+    active_subjects = {
+        subject for subject, data in registry.items() if data.get("active", True)
+    }
+
+    # A confirmed sample is stronger than all learned or generated signals.
+    for item in reversed(list(examples or [])):
+        subject = _clean_text(item.get("subject_group"), 80)
+        if subject not in active_subjects:
+            continue
+        if _clean_text(item.get("normalized_text"), 500).casefold() == clean.casefold():
+            result = {
+                "status": "subject_matched",
+                "stage": "subject_candidate",
+                "subject_group": subject,
+                "confidence": 0.99,
+                "score": 99,
+                "source": "feedback",
+                "evidence": [f"命中已确认文件名记忆：{subject}"],
+                "subject_candidates": [{
+                    "subject_group": subject,
+                    "confidence": 0.99,
+                    "source": "feedback",
+                }],
+            }
+            return _with_diagnostics(result, parsed, similarity_score=1.0, margin=1.0)
+
+    rule_result = _rules_classify_subject(
+        filename,
+        assignments=assignments,
+        rules=rules,
+        feedback=feedback,
+        subject_synonyms=subject_synonyms,
+        students=students,
+        sensitivity=sensitivity,
+        class_name=class_name,
+        class_aliases=class_aliases,
+        protected_terms=protected_terms,
+    )
+    rule_candidates = {
+        item.get("subject_group"): float(item.get("confidence", 0.0))
+        for item in rule_result.get("subject_candidates", [])
+        if item.get("subject_group") in active_subjects
+    }
+    best_rule = max(rule_candidates.values(), default=0.0)
+
+    # Confirmed aliases and legacy manual corrections stay deterministic.
+    if (
+        rule_result.get("status") == "subject_matched"
+        and rule_result.get("confidence", 0.0) >= 0.90
+    ):
+        return _with_diagnostics(rule_result, parsed, rule_score=best_rule, margin=1.0)
+    if rule_result.get("status") == "subject_conflict" and best_rule >= 0.90:
+        return _with_diagnostics(rule_result, parsed, rule_score=best_rule, margin=0.0)
+
+    similarity = [
+        item for item in classifier_trainer.similarity_predictions(
+            clean, examples or [], "subject_group", limit=5
+        )
+        if item["label"] in active_subjects
+    ]
+    model_predictions = []
+    if isinstance(model_bundle, dict):
+        model_predictions = [
+            item for item in classifier_trainer.predict_model(
+                model_bundle.get("course_model"),
+                clean,
+                parsed.get("extension", ""),
+            )
+            if item["label"] in active_subjects
+        ][:5]
+
+    if not similarity and not model_predictions:
+        return _with_diagnostics(rule_result, parsed, rule_score=best_rule)
+
+    similarity_scores = {item["label"]: item["confidence"] for item in similarity}
+    model_scores = {item["label"]: item["confidence"] for item in model_predictions}
+    subjects = set(rule_candidates) | set(similarity_scores) | set(model_scores)
+    model_weight = _model_weight(priority)
+    scored = []
+    for subject in subjects:
+        components = []
+        if subject in rule_candidates:
+            components.append((1.0 - model_weight, rule_candidates[subject]))
+        if subject in model_scores:
+            components.append((model_weight, model_scores[subject]))
+        if subject in similarity_scores:
+            components.append((0.35, similarity_scores[subject]))
+        weight_total = sum(weight for weight, _score in components) or 1.0
+        confidence = sum(weight * score for weight, score in components) / weight_total
+        scored.append({
+            "subject_group": subject,
+            "confidence": round(confidence, 4),
+            "rule_score": round(rule_candidates.get(subject, 0.0), 4),
+            "similarity_score": round(similarity_scores.get(subject, 0.0), 4),
+            "model_score": round(model_scores.get(subject, 0.0), 4),
+            "source": "merged",
+        })
+    scored.sort(key=lambda item: (-item["confidence"], item["subject_group"]))
+    best = scored[0] if scored else None
+    runner = scored[1]["confidence"] if len(scored) > 1 else 0.0
+    margin = best["confidence"] - runner if best else 0.0
+    matched = bool(best and best["confidence"] >= float(sensitivity) and margin >= 0.15)
+    evidence = list(rule_result.get("evidence", []))
+    if best:
+        if best["similarity_score"]:
+            evidence.append(f"相似确认样本：{best['similarity_score']:.2f}")
+        if best["model_score"]:
+            evidence.append(f"本地模型评分：{best['model_score']:.2f}")
+        if len(scored) > 1:
+            evidence.append(f"候选分差：{margin:.2f}")
+    result = {
+        "status": "subject_matched" if matched else (
+            "subject_suggested" if best else "unknown_subject"
+        ),
+        "stage": "subject_candidate" if matched else "pending_archive",
+        "subject_group": best["subject_group"] if matched and best else "",
+        "confidence": round(best["confidence"], 4) if best else 0.0,
+        "score": int(round(best["confidence"] * 100)) if best else 0,
+        "source": "merged" if best else rule_result.get("source", "rules"),
+        "evidence": evidence,
+        "subject_candidates": scored[:5],
+    }
+    return _with_diagnostics(
+        result,
+        parsed,
+        rule_score=best["rule_score"] if best else best_rule,
+        similarity_score=best["similarity_score"] if best else 0.0,
+        model_score=best["model_score"] if best else 0.0,
+        margin=margin,
+    )
+
+
+def classify_assignment_model(filename, subject_group, examples=None, model_bundle=None,
+                              students=None, class_name="", class_aliases=None,
+                              protected_terms=None):
+    parsed = inspect_filename(
+        filename,
+        students=students,
+        class_name=class_name,
+        class_aliases=class_aliases,
+        protected_terms=protected_terms,
+    )
+    clean = parsed["normalized_text"]
+    exact = []
+    for item in reversed(list(examples or [])):
+        if item.get("subject_group") != subject_group or not item.get("assignment_id"):
+            continue
+        if str(item.get("normalized_text") or "").casefold() == clean.casefold():
+            exact = [{"label": item["assignment_id"], "confidence": 0.99}]
+            break
+    similarity = classifier_trainer.similarity_predictions(
+        clean,
+        examples or [],
+        "assignment_id",
+        subject_group=subject_group,
+        limit=5,
+    )
+    model = (model_bundle or {}).get("assignment_models", {}).get(subject_group)
+    predictions = classifier_trainer.predict_model(
+        model,
+        clean,
+        parsed.get("extension", ""),
+    )[:5] if model else []
+    return {
+        "preprocess": parsed,
+        "exact": exact,
+        "similarity": similarity,
+        "model": predictions,
+    }
+
+
+def extract_keyword_candidates(subject, filenames, students=None, class_name="",
+                               class_aliases=None, protected_terms=None):
     subject = _clean_text(subject, 80)
     counts = {}
     examples = {}
     for filename in filenames or []:
-        clean = normalize_filename(filename, students)
+        clean = normalize_filename(
+            filename,
+            students,
+            class_name=class_name,
+            class_aliases=class_aliases,
+            protected_terms=protected_terms,
+        )
         parts = re.findall(r"[\u4e00-\u9fff]{2,12}|[a-zA-Z][a-zA-Z0-9.+#-]{1,20}|\d{1,3}", clean)
         for part in parts:
             token = part.strip()
@@ -370,6 +612,7 @@ def build_professional_pack_prompt(profile, courses, known_aliases=None):
 
 学校：{_clean_text(profile.get('school'), 100) or '未提供'}
 专业：{_clean_text(profile.get('major'), 100) or '未提供'}
+年级：{_clean_text(profile.get('grade'), 100) or '未提供'}
 学期：{_clean_text(profile.get('semester'), 100) or '未提供'}
 规则包名称：{_clean_text(profile.get('name'), 100) or '本学期课程包'}
 
@@ -379,18 +622,22 @@ def build_professional_pack_prompt(profile, courses, known_aliases=None):
 用户已知简称：
 {alias_lines}
 
-要求：
-1. subjects 的 key 必须严格来自上面的正式课程名称，不得新增课程。
-2. confirmed_aliases 只放可靠简称；不确定联想放 suggested_aliases。
-3. keywords 放课程知识点，不要把知识点当课程别名。
-4. assignment_types 放常见作业类型。
-5. 不确定时返回空数组，不得编造。
-6. 不得包含学生信息、文件路径或 API Key。
+生成目标：
+1. 这是开学前的课程分类冷启动包，不是具体作业清单，也不是训练样本。
+2. subjects 的 key 必须严格来自上面的正式课程名称，不得新增、改写或合并课程。
+3. confirmed_aliases 只放可靠简称、常用缩写和明确的英文名称。
+4. 不确定的简称或联想必须放 suggested_aliases，不能放入 confirmed_aliases。
+5. keywords 放课程知识点、专业术语、实验器件、软件工具和常见课程关键词。
+6. 不要把“作业、报告、实验、课程”等普通词当成课程关键词。
+7. assignment_types 只放实验报告、课后题、课程设计、课程论文等类型，不要虚构具体任务。
+8. 不要生成教师姓名、学生信息、文件路径、日期或 API Key。
+9. 多门课程可能共享的词只放在确实有代表性的课程中；不确定时返回空数组。
+10. 只输出 JSON，不要输出 Markdown 代码围栏、解释或额外文字。
 
 输出 schema：
 {{
   "schema_version": 1,
-  "profile": {{"name": "", "major": "", "semester": "", "school": ""}},
+  "profile": {{"name": "", "major": "", "grade": "", "semester": "", "school": ""}},
   "subjects": {{
     "正式课程名称": {{
       "active": true,

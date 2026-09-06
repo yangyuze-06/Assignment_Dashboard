@@ -35,7 +35,7 @@ echo    URL: http://localhost:%PORT%
 echo ============================================
 echo.
 
-if not exist "server.py" goto server_missing
+if not exist "py\server.py" goto server_missing
 if /I "%~1"=="--check" goto check_ok
 
 set /a restarts=0
@@ -44,7 +44,7 @@ set /a restarts=0
 echo Starting server with: %PYTHON_CMD% %PYTHON_ARGS%
 echo Press Ctrl+C to stop.
 echo.
-"%PYTHON_CMD%" %PYTHON_ARGS% server.py
+"%PYTHON_CMD%" %PYTHON_ARGS% py\server.py
 set "EXIT_CODE=%ERRORLEVEL%"
 if "%EXIT_CODE%"=="0" goto normal_exit
 
@@ -88,7 +88,7 @@ echo Startup script check OK.
 exit /b 0
 
 :server_missing
-echo [ERROR] server.py was not found in:
+echo [ERROR] py\server.py was not found in:
 echo %CD%
 echo.
 pause

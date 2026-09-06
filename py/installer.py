@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 作业追踪器 - 图形化安装向导
-维护者: Assignment_Dashboard 项目贡献者
+维护者: Assignment Dashboard 项目贡献者
 7步安装流程：欢迎→环境检测→班级设置→安装与目录配置→文件类型设置→科目关键词→安装执行
 """
 
@@ -59,13 +59,20 @@ FILE_TYPE_GROUPS = {
 
 # 需要安装到目标目录的文件列表
 INSTALL_FILES = [
-    "server.py",
-    "ai_classifier.py",
-    "restart_helper.py",
-    "dashboard.html",
-    "dashboard_modern.html",
-    "pack.py",
-    "repair_update.py",
+    "py/launcher.py",
+    "py/server.py",
+    "py/ai_classifier.py",
+    "py/classifier_features.py",
+    "py/classifier_trainer.py",
+    "py/restart_helper.py",
+    "html/dashboard.html",
+    "html/dashboard_modern.html",
+    "html/static/classic.css",
+    "html/static/classic.js",
+    "html/static/modern.css",
+    "html/static/modern.js",
+    "py/pack.py",
+    "py/repair_update.py",
     "requirements.txt",
     "repair_update.bat",
     "更新修复工具.bat",
@@ -87,7 +94,8 @@ def get_resource_path(relative_path):
     """获取资源文件路径（兼容 PyInstaller 打包和直接运行）"""
     if getattr(sys, 'frozen', False):
         return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(project_root, relative_path)
 
 
 def _is_drive_root(path):
@@ -1441,6 +1449,15 @@ class InstallerWizard:
                 "poll_interval": 5,
                 "templates": [],
                 "ignored_subjects": [],
+                "ai_classifier": {
+                    "mode": "rules",
+                    "sensitivity": 0.70,
+                    "sensitivity_preset": "balanced",
+                    "active_semester": "",
+                    "priority": "rules_first",
+                    "auto_train": True,
+                    "class_aliases": [],
+                },
                 "version": APP_VERSION
             }
             
@@ -1516,7 +1533,7 @@ class InstallerWizard:
                 'echo    URL: http://localhost:%PORT%\r\n'
                 'echo ============================================\r\n'
                 'echo.\r\n'
-                'if not exist "server.py" goto server_missing\r\n'
+                'if not exist "py\\server.py" goto server_missing\r\n'
                 'if /I "%~1"=="--check" goto check_ok\r\n'
                 'set /a restarts=0\r\n'
                 '\r\n'
@@ -1524,7 +1541,7 @@ class InstallerWizard:
                 'echo Starting server with: %PYTHON_CMD% %PYTHON_ARGS%\r\n'
                 'echo Press Ctrl+C to stop.\r\n'
                 'echo.\r\n'
-                '"%PYTHON_CMD%" %PYTHON_ARGS% server.py\r\n'
+                '"%PYTHON_CMD%" %PYTHON_ARGS% py\\server.py\r\n'
                 'set "EXIT_CODE=%ERRORLEVEL%"\r\n'
                 'if "%EXIT_CODE%"=="0" goto normal_exit\r\n'
                 'set /a restarts+=1\r\n'
@@ -1567,7 +1584,7 @@ class InstallerWizard:
                 'exit /b 0\r\n'
                 '\r\n'
                 ':server_missing\r\n'
-                'echo [ERROR] server.py was not found in:\r\n'
+                'echo [ERROR] py\\server.py was not found in:\r\n'
                 'echo %CD%\r\n'
                 'echo.\r\n'
                 'pause\r\n'

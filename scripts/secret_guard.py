@@ -60,6 +60,11 @@ def run_git(args: list[str]) -> str:
     return subprocess.check_output(["git", *args], cwd=ROOT, text=True, encoding="utf-8", errors="replace")
 
 
+def run_git_paths(args: list[str]) -> list[str]:
+    output = subprocess.check_output(["git", *args, "-z"], cwd=ROOT)
+    return [item.decode("utf-8", errors="replace") for item in output.split(b"\0") if item]
+
+
 def is_scannable(path: str) -> bool:
     parts = Path(path).parts
     if any(part in SKIP_DIRS for part in parts):
@@ -68,13 +73,13 @@ def is_scannable(path: str) -> bool:
 
 
 def staged_files() -> list[str]:
-    out = run_git(["diff", "--cached", "--name-only", "--diff-filter=ACMR"])
-    return [line.strip() for line in out.splitlines() if line.strip() and is_scannable(line.strip())]
+    paths = run_git_paths(["diff", "--cached", "--name-only", "--diff-filter=ACMR"])
+    return [path for path in paths if is_scannable(path)]
 
 
 def all_files() -> list[str]:
-    out = run_git(["ls-files", "-co", "--exclude-standard"])
-    return [line.strip() for line in out.splitlines() if line.strip() and is_scannable(line.strip())]
+    paths = run_git_paths(["ls-files", "-co", "--exclude-standard"])
+    return [path for path in paths if is_scannable(path)]
 
 
 def read_staged(path: str) -> str:
